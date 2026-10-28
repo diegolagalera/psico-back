@@ -1,0 +1,22 @@
+# Entorno virtual y caché de Python
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Variables de entorno reales
+.env
+.env.*
+!.env.example
+
+# Archivos multimedia subidos localmente
+protected_media/
+
+# Sistema operativo e IDE
+.DS_Store
+.vscode/
+.idea/
+*.log
