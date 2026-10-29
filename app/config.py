@@ -45,6 +45,10 @@ class Config:
 
     ADMIN_DEFAULT_EMAIL = _env("ADMIN_DEFAULT_EMAIL", "admin@vuelveati.com")
     ADMIN_DEFAULT_PASSWORD = _env("ADMIN_DEFAULT_PASSWORD", "Admin1234!")
-    CORS_ORIGINS = _env("CORS_ORIGINS", "*")
+    CORS_ORIGINS = _env(
+        "CORS_ORIGINS",
+        "https://carlaviladotpsicologia.com,https://www.carlaviladotpsicologia.com,http://localhost:5173",
+    )
+
 
 

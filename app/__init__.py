@@ -533,8 +533,17 @@ def create_app() -> Flask:
     app.config["MAX_CONTENT_LENGTH"] = 2 * 1024 * 1024 * 1024
 
     cors_origins = Config.CORS_ORIGINS
-    if cors_origins != "*" and "," in cors_origins:
-        cors_origins = [o.strip() for o in cors_origins.split(",") if o.strip()]
+    if cors_origins != "*":
+        parsed = [o.strip().rstrip("/") for o in cors_origins.split(",") if o.strip()]
+        default_domains = [
+            "https://carlaviladotpsicologia.com",
+            "https://www.carlaviladotpsicologia.com",
+            "http://localhost:5173",
+        ]
+        for d in default_domains:
+            if d not in parsed:
+                parsed.append(d)
+        cors_origins = parsed
 
     CORS(
         app,
