@@ -627,3 +627,223 @@ class SessionBooking(db.Model):
             data["user"] = self.user.to_dict() if self.user else None
             data["lesson_title"] = self.lesson.title if self.lesson else ""
         return data
+
+
+class PublicResource(db.Model):
+    """
+    Recurso público / Lead Magnet del Foro de Recursos ("Vuelve a Ti").
+    Muestra un teaser abierto y desbloquea el artículo completo, vídeo, audio y PDF
+    cuando el visitante introduce su correo electrónico aceptando comunicaciones de marketing.
+    """
+
+    __tablename__ = "public_resources"
+
+    id = db.Column(db.Integer, primary_key=True)
+    title = db.Column(db.String(220), nullable=False)
+    slug = db.Column(db.String(180), unique=True, nullable=False, index=True)
+    subtitle = db.Column(db.String(320), nullable=True, default="")
+    category = db.Column(
+        db.String(80), nullable=False, default="Regulación Emocional"
+    )
+    instagram_keyword = db.Column(db.String(80), nullable=True, default="RECURSO")
+    read_time_minutes = db.Column(db.Integer, nullable=False, default=5)
+    is_published = db.Column(db.Boolean, nullable=False, default=True, index=True)
+    is_featured = db.Column(db.Boolean, nullable=False, default=False)
+
+    # Portada
+    cover_image_url = db.Column(db.String(600), nullable=True, default="")
+    cover_storage_provider = db.Column(db.String(30), nullable=True, default="")
+    cover_object_key = db.Column(db.String(500), nullable=True, default="")
+
+    # Contenido editorial (Teaser abierto + Artículo completo desbloqueable)
+    teaser_text = db.Column(db.Text, nullable=True, default="")
+    content_body = db.Column(db.Text, nullable=True, default="")
+    key_takeaways_json = db.Column(db.Text, nullable=True, default="[]")
+    gallery_images_json = db.Column(db.Text, nullable=True, default="[]")
+
+    # Vídeo opcional (enlace externo o archivo subido)
+    video_external_url = db.Column(db.String(600), nullable=True, default="")
+    video_storage_provider = db.Column(db.String(30), nullable=True, default="")
+    video_object_key = db.Column(db.String(500), nullable=True, default="")
+    video_original_name = db.Column(db.String(255), nullable=True, default="")
+    video_mime_type = db.Column(db.String(100), nullable=True, default="video/mp4")
+
+    # Audio / Meditación opcional
+    audio_title = db.Column(db.String(220), nullable=True, default="")
+    audio_storage_provider = db.Column(db.String(30), nullable=True, default="")
+    audio_object_key = db.Column(db.String(500), nullable=True, default="")
+    audio_original_name = db.Column(db.String(255), nullable=True, default="")
+    audio_mime_type = db.Column(db.String(100), nullable=True, default="audio/mpeg")
+
+    # PDF / Cuaderno descargable opcional
+    pdf_title = db.Column(db.String(220), nullable=True, default="")
+    pdf_storage_provider = db.Column(db.String(30), nullable=True, default="")
+    pdf_object_key = db.Column(db.String(500), nullable=True, default="")
+    pdf_original_name = db.Column(db.String(255), nullable=True, default="")
+    pdf_file_size_bytes = db.Column(db.BigInteger, nullable=False, default=0)
+
+    # Analítica
+    views_count = db.Column(db.Integer, nullable=False, default=0)
+    unlocks_count = db.Column(db.Integer, nullable=False, default=0)
+
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    def to_dict(self, unlocked: bool = False) -> dict:
+        import json
+
+        try:
+            takeaways = (
+                json.loads(self.key_takeaways_json)
+                if self.key_takeaways_json
+                else []
+            )
+            if not isinstance(takeaways, list):
+                takeaways = []
+        except Exception:
+            takeaways = []
+
+        try:
+            gallery = (
+                json.loads(self.gallery_images_json)
+                if self.gallery_images_json
+                else []
+            )
+            if not isinstance(gallery, list):
+                gallery = []
+        except Exception:
+            gallery = []
+
+        has_video = bool(
+            (self.video_external_url or "").strip()
+            or (self.video_object_key or "").strip()
+        )
+        has_audio = bool((self.audio_object_key or "").strip())
+        has_pdf = bool((self.pdf_object_key or "").strip())
+
+        data = {
+            "id": self.id,
+            "title": self.title,
+            "slug": self.slug,
+            "subtitle": self.subtitle or "",
+            "category": self.category or "Regulación Emocional",
+            "instagram_keyword": self.instagram_keyword or "RECURSO",
+            "read_time_minutes": int(self.read_time_minutes or 5),
+            "is_published": bool(self.is_published),
+            "is_featured": bool(self.is_featured),
+            "cover_image_url": self.cover_image_url or "",
+            "cover_storage_provider": self.cover_storage_provider or "",
+            "cover_object_key": self.cover_object_key or "",
+            "teaser_text": self.teaser_text or "",
+            "key_takeaways": takeaways,
+            "has_video": has_video,
+            "has_audio": has_audio,
+            "has_pdf": has_pdf,
+            "audio_title": self.audio_title or self.audio_original_name or "Audio guiado del recurso",
+            "pdf_title": self.pdf_title or self.pdf_original_name or "Cuaderno Práctico Descargable (PDF)",
+            "pdf_file_size_bytes": int(self.pdf_file_size_bytes or 0),
+            "views_count": int(self.views_count or 0),
+            "unlocks_count": int(self.unlocks_count or 0),
+            "is_unlocked": bool(unlocked),
+            "created_at": _iso_utc(self.created_at),
+            "updated_at": _iso_utc(self.updated_at),
+        }
+
+        if unlocked:
+            data.update(
+                {
+                    "content_body": self.content_body or "",
+                    "gallery_images": gallery,
+                    "video_external_url": self.video_external_url or "",
+                    "video_storage_provider": self.video_storage_provider or "",
+                    "video_object_key": self.video_object_key or "",
+                    "video_original_name": self.video_original_name or "",
+                    "video_mime_type": self.video_mime_type or "video/mp4",
+                    "audio_storage_provider": self.audio_storage_provider or "",
+                    "audio_object_key": self.audio_object_key or "",
+                    "audio_original_name": self.audio_original_name or "",
+                    "audio_mime_type": self.audio_mime_type or "audio/mpeg",
+                    "pdf_storage_provider": self.pdf_storage_provider or "",
+                    "pdf_object_key": self.pdf_object_key or "",
+                    "pdf_original_name": self.pdf_original_name or "",
+                }
+            )
+        return data
+
+
+class MarketingLead(db.Model):
+    """
+    Suscriptor / Lead de Email Marketing captado desde el Foro de Recursos.
+    Si el email ya existe, se actualiza su actividad sin duplicar la fila.
+    """
+
+    __tablename__ = "marketing_leads"
+
+    id = db.Column(db.Integer, primary_key=True)
+    email = db.Column(db.String(180), unique=True, nullable=False, index=True)
+    name = db.Column(db.String(140), nullable=True, default="")
+    consent_marketing = db.Column(db.Boolean, nullable=False, default=True)
+    consent_text = db.Column(
+        db.String(500),
+        nullable=True,
+        default="Acepto recibir recursos gratuitos, novedades y comunicaciones de marketing de Carla Viladot.",
+    )
+    source_resource_id = db.Column(
+        db.Integer,
+        db.ForeignKey("public_resources.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    source_resource_title = db.Column(db.String(220), nullable=True, default="")
+    source_channel = db.Column(db.String(80), nullable=True, default="instagram_reel")
+    accessed_resources_json = db.Column(db.Text, nullable=True, default="[]")
+    unlock_count = db.Column(db.Integer, nullable=False, default=1)
+    created_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    last_seen_at = db.Column(
+        db.DateTime,
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    def to_dict(self) -> dict:
+        import json
+
+        try:
+            accessed = (
+                json.loads(self.accessed_resources_json)
+                if self.accessed_resources_json
+                else []
+            )
+            if not isinstance(accessed, list):
+                accessed = []
+        except Exception:
+            accessed = []
+
+        return {
+            "id": self.id,
+            "email": self.email,
+            "name": self.name or "",
+            "consent_marketing": bool(self.consent_marketing),
+            "consent_text": self.consent_text or "",
+            "source_resource_id": self.source_resource_id,
+            "source_resource_title": self.source_resource_title or "Foro de Recursos",
+            "source_channel": self.source_channel or "instagram_reel",
+            "accessed_resources": accessed,
+            "unlock_count": int(self.unlock_count or 1),
+            "created_at": _iso_utc(self.created_at),
+            "last_seen_at": _iso_utc(self.last_seen_at),
+        }
+

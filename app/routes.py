@@ -31,6 +31,8 @@ from app.models import (
     Enrollment,
     Lesson,
     LessonResource,
+    MarketingLead,
+    PublicResource,
     ResourceDownloadLog,
     SessionBooking,
     StudentLessonOverride,
@@ -685,6 +687,31 @@ def upload_media_endpoint():
     ok, meta, log_msg = store_uploaded_media(file_obj, folder_prefix=folder)
     if not ok:
         return jsonify({"error": log_msg}), 400
+
+    # Generar URL firmada de previsualización inmediata para el editor en vivo
+    try:
+        cfg = get_storage_config()
+        if meta.get("storage_provider") == "s3" and is_s3_ready(cfg):
+            meta["preview_url"] = generate_s3_presigned_url(
+                method="GET",
+                object_key=meta["object_key"],
+                expires_in=7200,
+                response_content_disposition="inline",
+                response_content_type=meta.get("mime_type") or "application/octet-stream",
+                cfg=cfg,
+            )
+        else:
+            tok = create_media_access_token(
+                user_id=0,
+                object_key=meta["object_key"],
+                mime_type=meta.get("mime_type") or "application/octet-stream",
+                disposition="inline",
+                filename=meta.get("original_filename") or "archivo",
+                expires_in=86400,
+            )
+            meta["preview_url"] = f"{request.host_url.rstrip('/')}/api/campus/media-stream/{tok}"
+    except Exception:
+        meta["preview_url"] = ""
 
     return (
         jsonify(
@@ -2141,3 +2168,565 @@ def campus_cancel_booking(booking_id: int):
         ),
         200,
     )
+
+
+# ==========================================================
+# 10. FORO DE RECURSOS GRATUITOS & CAPTURA DE LEADS (EMAIL MARKETING)
+# ==========================================================
+def _resolve_public_media_url(
+    storage_provider: str,
+    object_key: str,
+    mime_type: str = "application/octet-stream",
+    disposition: str = "inline",
+    filename: str = "recurso",
+    expires_in: int = 7200,
+) -> str:
+    """
+    Genera una URL firmada temporal (S3/R2 o almacenamiento local protegido)
+    para servir imágenes, vídeos, audios o PDFs del Foro de Recursos.
+    """
+    key_clean = (object_key or "").strip()
+    if not key_clean:
+        return ""
+    cfg = get_storage_config()
+    safe_name = sanitize_filename(filename or os.path.basename(key_clean) or "recurso")
+    if (storage_provider or "").strip() == "s3" and is_s3_ready(cfg):
+        return generate_s3_presigned_url(
+            method="GET",
+            object_key=key_clean,
+            expires_in=expires_in,
+            response_content_disposition=f'{disposition}; filename="{safe_name}"',
+            response_content_type=mime_type or "application/octet-stream",
+            cfg=cfg,
+        )
+    token = create_media_access_token(
+        user_id=0,
+        object_key=key_clean,
+        mime_type=mime_type or "application/octet-stream",
+        disposition=disposition,
+        filename=safe_name,
+        expires_in=expires_in,
+    )
+    base_api = f"{request.host_url.rstrip('/')}/api/campus/media-stream"
+    return f"{base_api}/{token}"
+
+
+def _enrich_public_resource_dict(res: PublicResource, unlocked: bool = False) -> dict:
+    data = res.to_dict(unlocked=unlocked)
+
+    # Resolver portada (si subió imagen a S3/local o si puso URL externa)
+    if res.cover_object_key:
+        data["cover_resolved_url"] = _resolve_public_media_url(
+            res.cover_storage_provider or "local",
+            res.cover_object_key,
+            mime_type="image/jpeg",
+            disposition="inline",
+            filename=os.path.basename(res.cover_object_key),
+            expires_in=14400,
+        )
+    else:
+        data["cover_resolved_url"] = res.cover_image_url or ""
+
+    if unlocked:
+        # Resolver galería de fotos inline
+        resolved_gallery = []
+        for item in data.get("gallery_images") or []:
+            if isinstance(item, dict):
+                entry = dict(item)
+                if entry.get("object_key"):
+                    entry["resolved_url"] = _resolve_public_media_url(
+                        entry.get("storage_provider") or "local",
+                        entry["object_key"],
+                        mime_type=entry.get("mime_type") or "image/jpeg",
+                        disposition="inline",
+                        filename=entry.get("original_filename") or "imagen.jpg",
+                        expires_in=14400,
+                    )
+                else:
+                    entry["resolved_url"] = entry.get("url") or ""
+                resolved_gallery.append(entry)
+        data["gallery_images"] = resolved_gallery
+
+        # Resolver Vídeo
+        if res.video_object_key:
+            data["video_stream_url"] = _resolve_public_media_url(
+                res.video_storage_provider or "local",
+                res.video_object_key,
+                mime_type=res.video_mime_type or "video/mp4",
+                disposition="inline",
+                filename=res.video_original_name or "video.mp4",
+                expires_in=7200,
+            )
+        else:
+            data["video_stream_url"] = ""
+
+        # Resolver Audio
+        if res.audio_object_key:
+            data["audio_stream_url"] = _resolve_public_media_url(
+                res.audio_storage_provider or "local",
+                res.audio_object_key,
+                mime_type=res.audio_mime_type or "audio/mpeg",
+                disposition="inline",
+                filename=res.audio_original_name or "audio.mp3",
+                expires_in=7200,
+            )
+        else:
+            data["audio_stream_url"] = ""
+
+        # Resolver PDF (tanto para leer en el navegador como para descargar)
+        if res.pdf_object_key:
+            pdf_fname = res.pdf_original_name or res.pdf_title or f"{res.slug}.pdf"
+            if not pdf_fname.lower().endswith(".pdf"):
+                pdf_fname = f"{pdf_fname}.pdf"
+            data["pdf_preview_url"] = _resolve_public_media_url(
+                res.pdf_storage_provider or "local",
+                res.pdf_object_key,
+                mime_type="application/pdf",
+                disposition="inline",
+                filename=pdf_fname,
+                expires_in=7200,
+            )
+            data["pdf_download_url"] = _resolve_public_media_url(
+                res.pdf_storage_provider or "local",
+                res.pdf_object_key,
+                mime_type="application/pdf",
+                disposition="attachment",
+                filename=pdf_fname,
+                expires_in=7200,
+            )
+        else:
+            data["pdf_preview_url"] = ""
+            data["pdf_download_url"] = ""
+
+    return data
+
+
+def _extract_visitor_lead_email() -> str:
+    email_raw = (
+        request.args.get("lead_email")
+        or request.headers.get("X-Lead-Email")
+        or ""
+    ).strip().lower()
+    return email_raw
+
+
+def _check_lead_unlocked(email_clean: str) -> MarketingLead | None:
+    if not email_clean or "@" not in email_clean:
+        return None
+    lead = MarketingLead.query.filter_by(email=email_clean).first()
+    if lead and lead.consent_marketing:
+        return lead
+    return None
+
+
+def _record_lead_resource_access(lead: MarketingLead, res: PublicResource) -> None:
+    now_utc = datetime.now(timezone.utc)
+    lead.last_seen_at = now_utc
+    try:
+        accessed = (
+            json.loads(lead.accessed_resources_json)
+            if lead.accessed_resources_json
+            else []
+        )
+        if not isinstance(accessed, list):
+            accessed = []
+    except Exception:
+        accessed = []
+
+    already_in = any(
+        isinstance(x, dict) and x.get("id") == res.id for x in accessed
+    )
+    if not already_in:
+        accessed.append(
+            {
+                "id": res.id,
+                "title": res.title,
+                "slug": res.slug,
+                "unlocked_at": now_utc.isoformat(),
+            }
+        )
+        lead.accessed_resources_json = json.dumps(accessed, ensure_ascii=False)
+        lead.unlock_count = len(accessed)
+        res.unlocks_count = int(res.unlocks_count or 0) + 1
+
+
+@api_bp.route("/resources", methods=["GET"])
+def public_list_resources():
+    """
+    Lista todos los recursos publicados en el Foro de Recursos.
+    Si el visitante ya tiene su email guardado en caché (localStorage) y figura
+    en `marketing_leads`, indica `is_lead_recognized: True`.
+    """
+    visitor_email = _extract_visitor_lead_email()
+    lead = _check_lead_unlocked(visitor_email)
+    is_unlocked = lead is not None
+
+    resources = (
+        PublicResource.query.filter_by(is_published=True)
+        .order_by(PublicResource.is_featured.desc(), PublicResource.created_at.desc())
+        .all()
+    )
+    return (
+        jsonify(
+            {
+                "resources": [
+                    _enrich_public_resource_dict(r, unlocked=is_unlocked)
+                    for r in resources
+                ],
+                "is_lead_recognized": is_unlocked,
+                "lead": lead.to_dict() if lead else None,
+            }
+        ),
+        200,
+    )
+
+
+@api_bp.route("/resources/<string:slug_or_id>", methods=["GET"])
+def public_get_resource_detail(slug_or_id: str):
+    """
+    Devuelve el detalle de un recurso por su slug o ID.
+    - Si el visitante aporta un `lead_email` ya registrado con consentimiento de marketing,
+      desbloquea automáticamente todo el recurso sin volver a pedir el correo.
+    - Si no, devuelve solo el Teaser Editorial para mostrar la tarjeta de captura de email.
+    """
+    res = PublicResource.query.filter_by(slug=slug_or_id).first()
+    if not res and slug_or_id.isdigit():
+        res = PublicResource.query.get(int(slug_or_id))
+    if not res or not res.is_published:
+        return jsonify({"error": "El recurso solicitado no existe o no está disponible."}), 404
+
+    res.views_count = int(res.views_count or 0) + 1
+
+    visitor_email = _extract_visitor_lead_email()
+    lead = _check_lead_unlocked(visitor_email)
+    is_unlocked = lead is not None
+
+    if is_unlocked and lead:
+        _record_lead_resource_access(lead, res)
+
+    db.session.commit()
+
+    # Otros recursos recomendados
+    related = (
+        PublicResource.query.filter(
+            PublicResource.is_published == True,
+            PublicResource.id != res.id,
+        )
+        .order_by(PublicResource.is_featured.desc(), PublicResource.created_at.desc())
+        .limit(3)
+        .all()
+    )
+
+    return (
+        jsonify(
+            {
+                "resource": _enrich_public_resource_dict(res, unlocked=is_unlocked),
+                "is_unlocked": is_unlocked,
+                "lead": lead.to_dict() if lead else None,
+                "related_resources": [
+                    _enrich_public_resource_dict(r, unlocked=False) for r in related
+                ],
+            }
+        ),
+        200,
+    )
+
+
+@api_bp.route("/resources/<string:slug_or_id>/unlock", methods=["POST"])
+def public_unlock_resource(slug_or_id: str):
+    """
+    Registra o actualiza el correo electrónico del visitante para Email Marketing
+    (evitando duplicados si ya existía) y desbloquea al instante el recurso completo.
+    """
+    res = PublicResource.query.filter_by(slug=slug_or_id).first()
+    if not res and slug_or_id.isdigit():
+        res = PublicResource.query.get(int(slug_or_id))
+    if not res or not res.is_published:
+        return jsonify({"error": "Recurso no encontrado."}), 404
+
+    data = request.get_json() or {}
+    email_clean = (data.get("email") or "").strip().lower()
+    name_clean = (data.get("name") or "").strip()
+    consent = bool(data.get("consent_marketing", False))
+    source_channel = (data.get("source_channel") or "instagram_reel").strip()
+
+    if not email_clean or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email_clean):
+        return (
+            jsonify({"error": "Por favor, introduce un correo electrónico válido."}),
+            400,
+        )
+
+    if not consent:
+        return (
+            jsonify(
+                {
+                    "error": "Debes aceptar el consentimiento de comunicaciones y email marketing para desbloquear el recurso gratuito."
+                }
+            ),
+            400,
+        )
+
+    now_utc = datetime.now(timezone.utc)
+    lead = MarketingLead.query.filter_by(email=email_clean).first()
+
+    if not lead:
+        accessed_init = [
+            {
+                "id": res.id,
+                "title": res.title,
+                "slug": res.slug,
+                "unlocked_at": now_utc.isoformat(),
+            }
+        ]
+        lead = MarketingLead(
+            email=email_clean,
+            name=name_clean,
+            consent_marketing=True,
+            consent_text=(
+                data.get("consent_text")
+                or "Acepto recibir recursos gratuitos, novedades y comunicaciones de marketing de Carla Viladot."
+            ),
+            source_resource_id=res.id,
+            source_resource_title=res.title,
+            source_channel=source_channel,
+            accessed_resources_json=json.dumps(accessed_init, ensure_ascii=False),
+            unlock_count=1,
+            created_at=now_utc,
+            last_seen_at=now_utc,
+        )
+        db.session.add(lead)
+        res.unlocks_count = int(res.unlocks_count or 0) + 1
+    else:
+        lead.consent_marketing = True
+        if name_clean and not lead.name:
+            lead.name = name_clean
+        _record_lead_resource_access(lead, res)
+
+    db.session.commit()
+
+    return (
+        jsonify(
+            {
+                "message": "¡Recurso desbloqueado! Hemos guardado tu acceso en este navegador para que no tengas que volver a introducir tu correo.",
+                "unlocked": True,
+                "lead": lead.to_dict(),
+                "resource": _enrich_public_resource_dict(res, unlocked=True),
+            }
+        ),
+        200,
+    )
+
+
+# --- Endpoints de Administración del Foro de Recursos & Leads ---
+@api_bp.route("/admin/public-resources", methods=["GET"])
+@admin_required
+def admin_list_public_resources():
+    resources = PublicResource.query.order_by(
+        PublicResource.is_featured.desc(), PublicResource.created_at.desc()
+    ).all()
+    total_leads = MarketingLead.query.count()
+    total_views = sum(int(r.views_count or 0) for r in resources)
+    total_unlocks = sum(int(r.unlocks_count or 0) for r in resources)
+
+    return (
+        jsonify(
+            {
+                "resources": [
+                    _enrich_public_resource_dict(r, unlocked=True) for r in resources
+                ],
+                "stats": {
+                    "total_resources": len(resources),
+                    "total_leads": total_leads,
+                    "total_views": total_views,
+                    "total_unlocks": total_unlocks,
+                },
+            }
+        ),
+        200,
+    )
+
+
+def _apply_resource_payload(res: PublicResource, data: dict) -> None:
+    if "title" in data and (data.get("title") or "").strip():
+        res.title = data["title"].strip()
+
+    if "slug" in data and (data.get("slug") or "").strip():
+        desired_slug = slugify(data["slug"])
+        existing = PublicResource.query.filter(
+            PublicResource.slug == desired_slug, PublicResource.id != res.id
+        ).first()
+        if not existing:
+            res.slug = desired_slug
+
+    if "subtitle" in data:
+        res.subtitle = (data.get("subtitle") or "").strip()
+    if "category" in data:
+        res.category = (data.get("category") or "Regulación Emocional").strip()
+    if "instagram_keyword" in data:
+        res.instagram_keyword = (data.get("instagram_keyword") or "RECURSO").strip().upper()
+    if "read_time_minutes" in data:
+        res.read_time_minutes = max(1, int(data.get("read_time_minutes") or 5))
+    if "is_published" in data:
+        res.is_published = bool(data["is_published"])
+    if "is_featured" in data:
+        res.is_featured = bool(data["is_featured"])
+
+    if "cover_image_url" in data:
+        res.cover_image_url = (data.get("cover_image_url") or "").strip()
+    if "cover_storage_provider" in data:
+        res.cover_storage_provider = (data.get("cover_storage_provider") or "").strip()
+    if "cover_object_key" in data:
+        res.cover_object_key = (data.get("cover_object_key") or "").strip()
+
+    if "teaser_text" in data:
+        res.teaser_text = data.get("teaser_text") or ""
+    if "content_body" in data:
+        res.content_body = data.get("content_body") or ""
+
+    if "key_takeaways" in data:
+        kt = data.get("key_takeaways")
+        if isinstance(kt, list):
+            res.key_takeaways_json = json.dumps(
+                [str(x).strip() for x in kt if str(x).strip()], ensure_ascii=False
+            )
+    if "gallery_images" in data:
+        gi = data.get("gallery_images")
+        if isinstance(gi, list):
+            res.gallery_images_json = json.dumps(gi, ensure_ascii=False)
+
+    if "video_external_url" in data:
+        res.video_external_url = (data.get("video_external_url") or "").strip()
+    if "video_storage_provider" in data:
+        res.video_storage_provider = (data.get("video_storage_provider") or "").strip()
+    if "video_object_key" in data:
+        res.video_object_key = (data.get("video_object_key") or "").strip()
+    if "video_original_name" in data:
+        res.video_original_name = (data.get("video_original_name") or "").strip()
+    if "video_mime_type" in data:
+        res.video_mime_type = (data.get("video_mime_type") or "video/mp4").strip()
+
+    if "audio_title" in data:
+        res.audio_title = (data.get("audio_title") or "").strip()
+    if "audio_storage_provider" in data:
+        res.audio_storage_provider = (data.get("audio_storage_provider") or "").strip()
+    if "audio_object_key" in data:
+        res.audio_object_key = (data.get("audio_object_key") or "").strip()
+    if "audio_original_name" in data:
+        res.audio_original_name = (data.get("audio_original_name") or "").strip()
+    if "audio_mime_type" in data:
+        res.audio_mime_type = (data.get("audio_mime_type") or "audio/mpeg").strip()
+
+    if "pdf_title" in data:
+        res.pdf_title = (data.get("pdf_title") or "").strip()
+    if "pdf_storage_provider" in data:
+        res.pdf_storage_provider = (data.get("pdf_storage_provider") or "").strip()
+    if "pdf_object_key" in data:
+        res.pdf_object_key = (data.get("pdf_object_key") or "").strip()
+    if "pdf_original_name" in data:
+        res.pdf_original_name = (data.get("pdf_original_name") or "").strip()
+    if "pdf_file_size_bytes" in data:
+        res.pdf_file_size_bytes = int(data.get("pdf_file_size_bytes") or 0)
+
+
+@api_bp.route("/admin/public-resources", methods=["POST"])
+@admin_required
+def admin_create_public_resource():
+    data = request.get_json() or {}
+    title = (data.get("title") or "").strip()
+    if not title:
+        return jsonify({"error": "El título del recurso es obligatorio."}), 400
+
+    base_slug = slugify(data.get("slug") or title)
+    slug = base_slug
+    counter = 2
+    while PublicResource.query.filter_by(slug=slug).first():
+        slug = f"{base_slug}-{counter}"
+        counter += 1
+
+    res = PublicResource(
+        title=title,
+        slug=slug,
+        subtitle=(data.get("subtitle") or "").strip(),
+        category=(data.get("category") or "Regulación Emocional").strip(),
+        instagram_keyword=(data.get("instagram_keyword") or "RECURSO").strip().upper(),
+        read_time_minutes=max(1, int(data.get("read_time_minutes") or 5)),
+        is_published=bool(data.get("is_published", True)),
+        is_featured=bool(data.get("is_featured", False)),
+    )
+    db.session.add(res)
+    db.session.flush()
+    _apply_resource_payload(res, data)
+    db.session.commit()
+
+    return (
+        jsonify(
+            {
+                "message": f"Recurso '{res.title}' creado correctamente.",
+                "resource": _enrich_public_resource_dict(res, unlocked=True),
+            }
+        ),
+        201,
+    )
+
+
+@api_bp.route("/admin/public-resources/<int:res_id>", methods=["PUT"])
+@admin_required
+def admin_update_public_resource(res_id: int):
+    res = PublicResource.query.get_or_404(res_id)
+    data = request.get_json() or {}
+    _apply_resource_payload(res, data)
+    res.updated_at = datetime.now(timezone.utc)
+    db.session.commit()
+
+    return (
+        jsonify(
+            {
+                "message": f"Recurso '{res.title}' guardado correctamente.",
+                "resource": _enrich_public_resource_dict(res, unlocked=True),
+            }
+        ),
+        200,
+    )
+
+
+@api_bp.route("/admin/public-resources/<int:res_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_public_resource(res_id: int):
+    res = PublicResource.query.get_or_404(res_id)
+    db.session.delete(res)
+    db.session.commit()
+    return jsonify({"message": "Recurso eliminado correctamente."}), 200
+
+
+@api_bp.route("/admin/marketing-leads", methods=["GET"])
+@admin_required
+def admin_list_marketing_leads():
+    leads = MarketingLead.query.order_by(MarketingLead.created_at.desc()).all()
+    resources = PublicResource.query.order_by(PublicResource.title.asc()).all()
+
+    return (
+        jsonify(
+            {
+                "leads": [l.to_dict() for l in leads],
+                "resources": [
+                    {"id": r.id, "title": r.title, "slug": r.slug, "unlocks_count": r.unlocks_count}
+                    for r in resources
+                ],
+                "stats": {
+                    "total_leads": len(leads),
+                    "total_unlocks": sum(int(l.unlock_count or 1) for l in leads),
+                },
+            }
+        ),
+        200,
+    )
+
+
+@api_bp.route("/admin/marketing-leads/<int:lead_id>", methods=["DELETE"])
+@admin_required
+def admin_delete_marketing_lead(lead_id: int):
+    lead = MarketingLead.query.get_or_404(lead_id)
+    db.session.delete(lead)
+    db.session.commit()
+    return jsonify({"message": "Suscriptor eliminado de la lista de marketing."}), 200
+
