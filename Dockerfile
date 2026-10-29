@@ -24,4 +24,5 @@ EXPOSE 5001
 HEALTHCHECK --interval=30s --timeout=10s --start-period=20s --retries=3 \
     CMD curl -f http://localhost:${PORT:-5001}/api/health || exit 1
 
-CMD ["sh", "-c", "gunicorn \"run:app\" --bind 0.0.0.0:${PORT:-5001} --workers 2 --threads 4 --timeout 300"]
+CMD ["sh", "-c", "gunicorn \"run:app\" --bind 0.0.0.0:${PORT:-5001} --workers 2 --threads 4 --timeout 300 --access-logfile - --error-logfile - --capture-output --log-level info"]
+
