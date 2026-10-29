@@ -6,18 +6,26 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _env(key: str, default: str = "") -> str:
+    val = os.getenv(key)
+    if val is None or not str(val).strip():
+        return default
+    return str(val).strip()
+
+
 class Config:
-    DB_HOST = os.getenv("DB_HOST") or os.getenv("MYSQLHOST", "localhost")
-    DB_PORT = os.getenv("DB_PORT") or os.getenv("MYSQLPORT", "3306")
-    DB_NAME = os.getenv("DB_NAME") or os.getenv("MYSQLDATABASE") or os.getenv("MYSQL_DATABASE", "psicologia")
-    DB_USER = os.getenv("DB_USER") or os.getenv("MYSQLUSER", "psicologiauser")
-    DB_PASSWORD = os.getenv("DB_PASSWORD") or os.getenv("MYSQLPASSWORD") or os.getenv("MYSQL_ROOT_PASSWORD", "Psicologiapassword123.")
+    DB_HOST = _env("DB_HOST") or _env("MYSQLHOST", "localhost")
+    _raw_port = _env("DB_PORT") or _env("MYSQLPORT", "3306")
+    DB_PORT = _raw_port if _raw_port.isdigit() else "3306"
+    DB_NAME = _env("DB_NAME") or _env("MYSQLDATABASE") or _env("MYSQL_DATABASE", "psicologia")
+    DB_USER = _env("DB_USER") or _env("MYSQLUSER", "psicologiauser")
+    DB_PASSWORD = _env("DB_PASSWORD") or _env("MYSQLPASSWORD") or _env("MYSQL_ROOT_PASSWORD", "Psicologiapassword123.")
 
     encoded_password = quote_plus(DB_PASSWORD)
 
     _raw_db_url = (
-        os.getenv("DATABASE_URL")
-        or os.getenv("MYSQL_URL")
+        _env("DATABASE_URL")
+        or _env("MYSQL_URL")
         or f"mysql+pymysql://{DB_USER}:{encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}?charset=utf8mb4"
     )
     if _raw_db_url.startswith("mysql://"):
@@ -30,12 +38,13 @@ class Config:
         "pool_recycle": 280,
     }
 
-    JWT_SECRET_KEY = os.getenv(
+    JWT_SECRET_KEY = _env(
         "JWT_SECRET_KEY", "vuelve-a-ti-super-secret-jwt-key-2026-psicologia"
     )
     JWT_ACCESS_TOKEN_EXPIRES = timedelta(hours=12)
 
-    ADMIN_DEFAULT_EMAIL = os.getenv("ADMIN_DEFAULT_EMAIL", "admin@vuelveati.com")
-    ADMIN_DEFAULT_PASSWORD = os.getenv("ADMIN_DEFAULT_PASSWORD", "Admin1234!")
-    CORS_ORIGINS = os.getenv("CORS_ORIGINS", "*")
+    ADMIN_DEFAULT_EMAIL = _env("ADMIN_DEFAULT_EMAIL", "admin@vuelveati.com")
+    ADMIN_DEFAULT_PASSWORD = _env("ADMIN_DEFAULT_PASSWORD", "Admin1234!")
+    CORS_ORIGINS = _env("CORS_ORIGINS", "*")
+
 
