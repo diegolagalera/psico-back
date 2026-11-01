@@ -65,6 +65,8 @@ from app.storage_service import (
     test_s3_connection,
     create_media_access_token,
     verify_media_access_token,
+    is_trusted_s3_presigned_url,
+    open_trusted_s3_url,
 )
 
 api_bp = Blueprint("api", __name__)
@@ -1850,6 +1852,100 @@ def campus_serve_protected_media(token: str):
     )
     resp.headers["Accept-Ranges"] = "bytes"
     resp.headers["Content-Disposition"] = f'inline; filename="{filename}"'
+    resp.headers["Cache-Control"] = "private, no-store, max-age=0"
+    return resp
+
+
+PDF_PROXY_MAX_BYTES = 150 * 1024 * 1024  # 150 MB
+
+
+@api_bp.route("/media/pdf-proxy", methods=["GET"])
+def pdf_viewer_proxy():
+    """
+    Proxy seguro para el visor de PDF integrado (PDF.js) del frontend.
+
+    El navegador no puede leer por JavaScript un PDF alojado en Cloudflare R2 / S3 si el
+    bucket no tiene CORS configurado (el <iframe> sí puede, por eso "el visor básico funciona").
+    Este endpoint descarga el PDF en el servidor y lo devuelve desde el dominio de la API,
+    que ya tiene CORS habilitado para el frontend.
+
+    Seguridad:
+      - Solo acepta tokens propios de /campus/media-stream/<token> (firmados y con caducidad)
+        o URLs firmadas (X-Amz-Signature) del endpoint/bucket S3 configurado.
+      - Verifica que el contenido empieza por la firma "%PDF".
+      - Limita el tamaño máximo servido.
+    """
+    src = (request.args.get("src") or "").strip()
+    if not src:
+        return jsonify({"error": "Falta el parámetro src."}), 400
+
+    parsed = urllib.parse.urlparse(src)
+
+    # 1) Archivo local protegido mediante token propio
+    marker = "/api/campus/media-stream/"
+    if marker in parsed.path:
+        token = urllib.parse.unquote(parsed.path.split(marker, 1)[1])
+        payload = verify_media_access_token(token)
+        if not payload:
+            return jsonify({"error": "El enlace seguro ha caducado o no es válido."}), 403
+
+        rel_key = (payload.get("k") or "").lstrip("/")
+        base_dir = ensure_protected_storage_dir()
+        abs_path = os.path.abspath(os.path.join(base_dir, rel_key.replace("/", os.sep)))
+        if not abs_path.startswith(base_dir) or not os.path.isfile(abs_path):
+            return jsonify({"error": "Archivo no encontrado en el almacenamiento."}), 404
+
+        with open(abs_path, "rb") as fh:
+            if fh.read(5)[:4] != b"%PDF":
+                return jsonify({"error": "El archivo solicitado no es un PDF."}), 415
+
+        resp = send_file(abs_path, mimetype="application/pdf", as_attachment=False, conditional=True)
+        resp.headers["Cache-Control"] = "private, no-store, max-age=0"
+        return resp
+
+    # 2) URL firmada de Cloudflare R2 / S3
+    cfg = get_storage_config()
+    if not is_trusted_s3_presigned_url(src, cfg):
+        return jsonify({"error": "Origen del documento no permitido."}), 403
+
+    try:
+        upstream = open_trusted_s3_url(src)
+    except Exception as exc:  # noqa: BLE001
+        status = getattr(exc, "code", 502) or 502
+        return (
+            jsonify({"error": "No se pudo obtener el documento del almacenamiento."}),
+            403 if status == 403 else 502,
+        )
+
+    content_length = upstream.headers.get("Content-Length")
+    if content_length and content_length.isdigit() and int(content_length) > PDF_PROXY_MAX_BYTES:
+        upstream.close()
+        return jsonify({"error": "El documento es demasiado grande para el visor."}), 413
+
+    first_chunk = upstream.read(64 * 1024)
+    if not first_chunk.startswith(b"%PDF"):
+        upstream.close()
+        return jsonify({"error": "El archivo solicitado no es un PDF."}), 415
+
+    def generate():
+        sent = len(first_chunk)
+        try:
+            yield first_chunk
+            while True:
+                chunk = upstream.read(256 * 1024)
+                if not chunk:
+                    break
+                sent += len(chunk)
+                if sent > PDF_PROXY_MAX_BYTES:
+                    break
+                yield chunk
+        finally:
+            upstream.close()
+
+    resp = Response(generate(), mimetype="application/pdf", direct_passthrough=True)
+    if content_length and content_length.isdigit():
+        resp.headers["Content-Length"] = content_length
+    resp.headers["Content-Disposition"] = "inline"
     resp.headers["Cache-Control"] = "private, no-store, max-age=0"
     return resp
 

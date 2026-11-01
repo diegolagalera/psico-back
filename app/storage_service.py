@@ -405,6 +405,47 @@ def verify_media_access_token(token: str) -> dict | None:
         return None
 
 
+def is_trusted_s3_presigned_url(url: str, cfg: dict | None = None) -> bool:
+    """
+    Comprueba que una URL pertenece al endpoint/bucket S3-R2 configurado y que es
+    una URL firmada (X-Amz-Signature). Evita usar el proxy como pasarela abierta (SSRF).
+    """
+    try:
+        if cfg is None:
+            cfg = get_storage_config()
+        if not is_s3_ready(cfg):
+            return False
+
+        endpoint_url = (cfg.get("s3_endpoint_url") or "").strip().rstrip("/")
+        if not endpoint_url.startswith("http"):
+            endpoint_url = "https://" + endpoint_url
+        endpoint = urllib.parse.urlparse(endpoint_url)
+        target = urllib.parse.urlparse(url)
+
+        if target.scheme not in ("http", "https"):
+            return False
+        if (target.netloc or "").lower() != (endpoint.netloc or "").lower():
+            return False
+
+        bucket = (cfg.get("s3_bucket_name") or "").strip()
+        if bucket and f"/{bucket}/" not in target.path:
+            return False
+
+        query = urllib.parse.parse_qs(target.query)
+        return bool(query.get("X-Amz-Signature"))
+    except Exception:
+        return False
+
+
+def open_trusted_s3_url(url: str, timeout: int = 30):
+    """
+    Abre (lado servidor) una URL firmada de S3/R2 ya validada y devuelve la respuesta
+    urllib para hacer streaming de su contenido.
+    """
+    req = urllib.request.Request(url, method="GET")
+    return urllib.request.urlopen(req, timeout=timeout, context=_get_ssl_context())
+
+
 def store_uploaded_media(
     file_storage,
     folder_prefix: str = "courses",
