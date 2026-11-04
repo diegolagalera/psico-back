@@ -2616,7 +2616,7 @@ def public_unlock_resource(slug_or_id: str):
             )
             send_system_email(
                 to_email="cviladotpsicologa@gmail.com",
-                subject="Nuevo leed",
+                subject="Nuevo Lead",
                 html_body=lead_html,
             )
         except Exception:
