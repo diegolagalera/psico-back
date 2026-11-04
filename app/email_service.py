@@ -257,3 +257,23 @@ def build_contact_notification_html(
       </div>
     </div>
     """
+
+
+def build_new_lead_notification_html(
+    email: str, name: str, resource_title: str, source_channel: str = ""
+) -> str:
+    return f"""
+    <div style="font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #FAF8F5; padding: 32px; color: #2C3E35;">
+      <div style="max-width: 580px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; padding: 32px; border: 1px solid #E6E1DA;">
+        <span style="background: #4A6B5D; color: #FFFFFF; padding: 4px 10px; border-radius: 99px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">
+          Nuevo Lead · Foro de Recursos
+        </span>
+        <h2 style="margin: 16px 0 12px 0; color: #2C3E35;">Nuevo leed registrado en "Vuelve a Ti"</h2>
+        <p style="font-size: 14px; margin: 6px 0;"><strong>Email:</strong> <a href="mailto:{email}" style="color: #4A6B5D;">{email}</a></p>
+        <p style="font-size: 14px; margin: 6px 0;"><strong>Nombre:</strong> {name or 'No especificado'}</p>
+        <p style="font-size: 14px; margin: 6px 0;"><strong>Recurso desbloqueado:</strong> {resource_title}</p>
+        <p style="font-size: 14px; margin: 6px 0;"><strong>Canal de origen:</strong> {source_channel or 'Web / Instagram'}</p>
+      </div>
+    </div>
+    """
+

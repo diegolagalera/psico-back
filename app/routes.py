@@ -23,6 +23,7 @@ from app.course_service import (
 )
 from app.email_service import (
     build_contact_notification_html,
+    build_new_lead_notification_html,
     build_welcome_email_html,
     get_or_create_system_config,
     send_system_email,
@@ -2568,6 +2569,7 @@ def public_unlock_resource(slug_or_id: str):
 
     now_utc = datetime.now(timezone.utc)
     lead = MarketingLead.query.filter_by(email=email_clean).first()
+    is_new_lead = lead is None
 
     if not lead:
         accessed_init = [
@@ -2603,6 +2605,22 @@ def public_unlock_resource(slug_or_id: str):
         _record_lead_resource_access(lead, res)
 
     db.session.commit()
+
+    if is_new_lead:
+        try:
+            lead_html = build_new_lead_notification_html(
+                email=email_clean,
+                name=name_clean,
+                resource_title=res.title,
+                source_channel=source_channel,
+            )
+            send_system_email(
+                to_email="cviladotpsicologa@gmail.com",
+                subject="Nuevo leed",
+                html_body=lead_html,
+            )
+        except Exception:
+            pass
 
     return (
         jsonify(
