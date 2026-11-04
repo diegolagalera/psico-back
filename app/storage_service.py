@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import json
@@ -377,7 +378,11 @@ def create_media_access_token(
         "e": exp,
     }
     raw_json = json.dumps(payload, separators=(",", ":"), sort_keys=True)
-    b64_payload = urllib.parse.quote(raw_json, safe="")
+    b64_payload = (
+        base64.urlsafe_b64encode(raw_json.encode("utf-8"))
+        .decode("ascii")
+        .rstrip("=")
+    )
     sig = hmac.new(
         secret.encode("utf-8"), b64_payload.encode("utf-8"), hashlib.sha256
     ).hexdigest()
@@ -391,12 +396,32 @@ def verify_media_access_token(token: str) -> dict | None:
         if len(parts) != 2:
             return None
         b64_payload, sig = parts
+
+        # 1) Verificar firma directa (urlsafe_b64encode o token sin decodificar)
         expected_sig = hmac.new(
             secret.encode("utf-8"), b64_payload.encode("utf-8"), hashlib.sha256
         ).hexdigest()
-        if not hmac.compare_digest(sig, expected_sig):
+        valid_sig = hmac.compare_digest(sig, expected_sig)
+
+        # 2) Compatibilidad con tokens antiguos URL-encoded decodificados automáticamente por Flask
+        if not valid_sig:
+            re_quoted = urllib.parse.quote(b64_payload, safe="")
+            alt_sig = hmac.new(
+                secret.encode("utf-8"), re_quoted.encode("utf-8"), hashlib.sha256
+            ).hexdigest()
+            valid_sig = hmac.compare_digest(sig, alt_sig)
+
+        if not valid_sig:
             return None
-        raw_json = urllib.parse.unquote(b64_payload)
+
+        if b64_payload.startswith("{") or b64_payload.startswith("%7B"):
+            raw_json = urllib.parse.unquote(b64_payload)
+        else:
+            pad = "=" * (-len(b64_payload) % 4)
+            raw_json = base64.urlsafe_b64decode(
+                (b64_payload + pad).encode("ascii")
+            ).decode("utf-8")
+
         payload = json.loads(raw_json)
         if int(payload.get("e", 0)) < int(time.time()):
             return None
@@ -442,7 +467,11 @@ def open_trusted_s3_url(url: str, timeout: int = 30):
     Abre (lado servidor) una URL firmada de S3/R2 ya validada y devuelve la respuesta
     urllib para hacer streaming de su contenido.
     """
-    req = urllib.request.Request(url, method="GET")
+    req = urllib.request.Request(
+        url,
+        method="GET",
+        headers={"User-Agent": "VuelveATi-Storage/1.0"},
+    )
     return urllib.request.urlopen(req, timeout=timeout, context=_get_ssl_context())
 
 
