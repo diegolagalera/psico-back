@@ -2771,12 +2771,12 @@ def public_resource_og_html(slug_or_id: str):
         proto = "https"
     api_base = f"{proto}://{host}"
 
+    title_str = "Vuelve a Ti | Programa de 10 semanas para superar tu ruptura"
     if res and res.is_published:
-        title_str = f"{res.title} · Carla Viladot"
         raw_desc = (
             res.subtitle
             or res.teaser_text
-            or "Recurso gratuito de psicología y reconstrucción personal por Carla Viladot."
+            or "Programa de 10 semanas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
         )
         clean_desc = re.sub(r"\s+", " ", raw_desc).strip()
         if len(clean_desc) > 220:
@@ -2784,8 +2784,7 @@ def public_resource_og_html(slug_or_id: str):
         canonical_url = f"https://www.carlaviladotpsicologia.com/recursos/{res.slug}"
         image_url = f"{api_base}/api/og/resources/{res.slug}/cover.jpg"
     else:
-        title_str = "Recursos Gratuitos · Carla Viladot | Vuelve a Ti"
-        clean_desc = "Guías prácticas y herramientas terapéuticas gratuitas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
+        clean_desc = "Programa de 10 semanas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
         canonical_url = "https://www.carlaviladotpsicologia.com/recursos"
         image_url = DEFAULT_OG_FALLBACK_IMAGE
 
@@ -2806,7 +2805,7 @@ def public_resource_og_html(slug_or_id: str):
     <!-- Open Graph / Instagram DM / WhatsApp / Facebook -->
     <meta property="og:type" content="article" />
     <meta property="og:locale" content="es_ES" />
-    <meta property="og:site_name" content="Vuelve a Ti · Carla Viladot" />
+    <meta property="og:site_name" content="{esc_title}" />
     <meta property="og:title" content="{esc_title}" />
     <meta property="og:description" content="{esc_desc}" />
     <meta property="og:url" content="{esc_url}" />
