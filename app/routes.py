@@ -1,11 +1,14 @@
 import base64
 from datetime import datetime, timedelta, timezone
 from functools import wraps
+import html
+import io
 import json
 import mimetypes
 import os
 import re
 import urllib.parse
+import urllib.request
 from flask import Blueprint, Response, jsonify, redirect, request, send_file
 from flask_jwt_extended import (
     create_access_token,
@@ -56,6 +59,7 @@ from app.calendar_service import (
     test_calendar_connection,
 )
 from app.storage_service import (
+    _get_ssl_context,
     ensure_protected_storage_dir,
     generate_s3_presigned_url,
     get_storage_config,
@@ -2611,6 +2615,222 @@ def public_unlock_resource(slug_or_id: str):
         ),
         200,
     )
+
+
+DEFAULT_OG_FALLBACK_IMAGE = "https://www.carlaviladotpsicologia.com/images/carla-viladot.jpg"
+OG_IMAGE_MAX_BYTES = 15 * 1024 * 1024  # 15 MB
+
+
+def _detect_image_mime(raw_bytes: bytes, fallback: str = "image/jpeg") -> str:
+    if raw_bytes.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg"
+    if raw_bytes.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if len(raw_bytes) >= 12 and raw_bytes[:4] == b"RIFF" and raw_bytes[8:12] == b"WEBP":
+        return "image/webp"
+    if raw_bytes.startswith((b"GIF87a", b"GIF89a")):
+        return "image/gif"
+    return fallback
+
+
+def _normalize_og_image_bytes(
+    raw_bytes: bytes, fallback_mime: str = "image/jpeg"
+) -> tuple[bytes, str]:
+    """
+    Convierte y optimiza la imagen de portada a JPEG estándar (máx. 1200x1200 px)
+    para máxima compatibilidad con los crawlers de Instagram DM, WhatsApp y Meta,
+    que a menudo fallan con formatos WebP o imágenes de varios megabytes.
+    """
+    if not raw_bytes:
+        return b"", fallback_mime
+    try:
+        from PIL import Image, ImageOps  # type: ignore
+
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            img = ImageOps.exif_transpose(img)
+            if img.mode in ("RGBA", "LA") or (
+                img.mode == "P" and "transparency" in img.info
+            ):
+                rgba = img.convert("RGBA")
+                bg = Image.new("RGB", rgba.size, (250, 248, 245))  # #FAF8F5
+                bg.paste(rgba, mask=rgba.split()[3])
+                img = bg
+            elif img.mode != "RGB":
+                img = img.convert("RGB")
+
+            if img.width > 1200 or img.height > 1200:
+                img.thumbnail((1200, 1200), Image.Resampling.LANCZOS)
+
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=85, optimize=True)
+            return out.getvalue(), "image/jpeg"
+    except Exception:
+        return raw_bytes, _detect_image_mime(raw_bytes, fallback_mime)
+
+
+def _build_image_response(raw_bytes: bytes, fallback_mime: str = "image/jpeg") -> Response:
+    norm_bytes, mime_type = _normalize_og_image_bytes(raw_bytes, fallback_mime)
+    resp = Response(norm_bytes, status=200, mimetype=mime_type, direct_passthrough=True)
+    resp.headers["Content-Length"] = str(len(norm_bytes))
+    resp.headers["Content-Disposition"] = 'inline; filename="cover.jpg"'
+    resp.headers["Cache-Control"] = "public, max-age=3600"
+    return resp
+
+
+@api_bp.route("/og/resources/<string:slug_or_id>/cover.jpg", methods=["GET"])
+def public_resource_og_cover(slug_or_id: str):
+    """
+    Endpoint público permanente (sin caducidad de firma S3) que sirve la imagen de portada
+    de un recurso gratuito directamente para previsualizaciones de Instagram DM, WhatsApp y Meta.
+    """
+    res = PublicResource.query.filter_by(slug=slug_or_id).first()
+    if not res and slug_or_id.isdigit():
+        res = PublicResource.query.get(int(slug_or_id))
+    if not res or not res.is_published:
+        return redirect(DEFAULT_OG_FALLBACK_IMAGE, code=302)
+
+    # 1) Portada subida a S3 / Cloudflare R2 o almacenamiento local
+    key_clean = (res.cover_object_key or "").strip()
+    if key_clean:
+        guessed_mime = mimetypes.guess_type(key_clean)[0] or "image/jpeg"
+        cfg = get_storage_config()
+        if (res.cover_storage_provider or "").strip() == "s3" and is_s3_ready(cfg):
+            try:
+                s3_url = generate_s3_presigned_url(
+                    method="GET",
+                    object_key=key_clean,
+                    expires_in=600,
+                    response_content_disposition='inline; filename="cover.jpg"',
+                    response_content_type=guessed_mime,
+                    cfg=cfg,
+                )
+                with open_trusted_s3_url(s3_url, timeout=15) as upstream:
+                    raw_bytes = upstream.read(OG_IMAGE_MAX_BYTES)
+                if raw_bytes:
+                    return _build_image_response(raw_bytes, guessed_mime)
+            except Exception:
+                pass
+
+        # Fallback archivo local en protected_media/
+        base_dir = ensure_protected_storage_dir()
+        abs_path = os.path.abspath(
+            os.path.join(base_dir, key_clean.lstrip("/").replace("/", os.sep))
+        )
+        if abs_path.startswith(base_dir) and os.path.isfile(abs_path):
+            try:
+                with open(abs_path, "rb") as fh:
+                    raw_bytes = fh.read(OG_IMAGE_MAX_BYTES)
+                if raw_bytes:
+                    return _build_image_response(raw_bytes, guessed_mime)
+            except Exception:
+                pass
+
+    # 2) Portada definida mediante URL externa o ruta relativa
+    ext_url = (res.cover_image_url or "").strip()
+    if ext_url:
+        if ext_url.startswith("/"):
+            return redirect(
+                f"https://www.carlaviladotpsicologia.com{ext_url}", code=302
+            )
+        if ext_url.startswith(("http://", "https://")):
+            try:
+                req = urllib.request.Request(
+                    ext_url,
+                    method="GET",
+                    headers={
+                        "User-Agent": "Mozilla/5.0 (compatible; VuelveATiOG/1.0)"
+                    },
+                )
+                with urllib.request.urlopen(
+                    req, timeout=15, context=_get_ssl_context()
+                ) as upstream:
+                    raw_bytes = upstream.read(OG_IMAGE_MAX_BYTES)
+                    c_type = upstream.headers.get("Content-Type") or "image/jpeg"
+                if raw_bytes:
+                    return _build_image_response(raw_bytes, c_type.split(";")[0].strip())
+            except Exception:
+                return redirect(ext_url, code=302)
+
+    return redirect(DEFAULT_OG_FALLBACK_IMAGE, code=302)
+
+
+@api_bp.route("/og/resources/<string:slug_or_id>", methods=["GET"])
+def public_resource_og_html(slug_or_id: str):
+    """
+    Devuelve las etiquetas Open Graph y Twitter Card específicas de un recurso gratuito
+    (título, subtítulo y foto de portada del recurso) para los crawlers de redes sociales
+    (Instagram DM, WhatsApp, Facebook/Meta, Telegram, X/Twitter, LinkedIn).
+    """
+    res = PublicResource.query.filter_by(slug=slug_or_id).first()
+    if not res and slug_or_id.isdigit():
+        res = PublicResource.query.get(int(slug_or_id))
+
+    proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
+    host = (request.headers.get("X-Forwarded-Host") or request.host or "api.carlaviladotpsicologia.com").split(",")[0].strip()
+    if "carlaviladotpsicologia.com" in host:
+        proto = "https"
+    api_base = f"{proto}://{host}"
+
+    if res and res.is_published:
+        title_str = f"{res.title} · Carla Viladot"
+        raw_desc = (
+            res.subtitle
+            or res.teaser_text
+            or "Recurso gratuito de psicología y reconstrucción personal por Carla Viladot."
+        )
+        clean_desc = re.sub(r"\s+", " ", raw_desc).strip()
+        if len(clean_desc) > 220:
+            clean_desc = clean_desc[:217].rstrip() + "..."
+        canonical_url = f"https://www.carlaviladotpsicologia.com/recursos/{res.slug}"
+        image_url = f"{api_base}/api/og/resources/{res.slug}/cover.jpg"
+    else:
+        title_str = "Recursos Gratuitos · Carla Viladot | Vuelve a Ti"
+        clean_desc = "Guías prácticas y herramientas terapéuticas gratuitas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
+        canonical_url = "https://www.carlaviladotpsicologia.com/recursos"
+        image_url = DEFAULT_OG_FALLBACK_IMAGE
+
+    esc_title = html.escape(title_str, quote=True)
+    esc_desc = html.escape(clean_desc, quote=True)
+    esc_url = html.escape(canonical_url, quote=True)
+    esc_img = html.escape(image_url, quote=True)
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>{esc_title}</title>
+    <meta name="description" content="{esc_desc}" />
+    <link rel="canonical" href="{esc_url}" />
+
+    <!-- Open Graph / Instagram DM / WhatsApp / Facebook -->
+    <meta property="og:type" content="article" />
+    <meta property="og:locale" content="es_ES" />
+    <meta property="og:site_name" content="Vuelve a Ti · Carla Viladot" />
+    <meta property="og:title" content="{esc_title}" />
+    <meta property="og:description" content="{esc_desc}" />
+    <meta property="og:url" content="{esc_url}" />
+    <meta property="og:image" content="{esc_img}" />
+    <meta property="og:image:secure_url" content="{esc_img}" />
+    <meta property="og:image:type" content="image/jpeg" />
+    <meta property="og:image:alt" content="{esc_title}" />
+
+    <!-- Twitter / X Card -->
+    <meta name="twitter:card" content="summary_large_image" />
+    <meta name="twitter:title" content="{esc_title}" />
+    <meta name="twitter:description" content="{esc_desc}" />
+    <meta name="twitter:image" content="{esc_img}" />
+  </head>
+  <body>
+    <h1>{esc_title}</h1>
+    <p>{esc_desc}</p>
+    <p><a href="{esc_url}">Acceder al recurso gratuito</a></p>
+  </body>
+</html>"""
+
+    resp = Response(html_doc, status=200, mimetype="text/html; charset=utf-8")
+    resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
 
 
 # --- Endpoints de Administración del Foro de Recursos & Leads ---
