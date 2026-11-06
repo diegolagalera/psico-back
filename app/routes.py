@@ -2782,13 +2782,19 @@ def public_resource_og_cover(slug_or_id: str):
 @api_bp.route("/og/resources/<string:slug_or_id>", methods=["GET"])
 def public_resource_og_html(slug_or_id: str):
     """
-    Devuelve las etiquetas Open Graph y Twitter Card específicas de un recurso gratuito
-    (título, subtítulo y foto de portada del recurso) para los crawlers de redes sociales
+    Devuelve el documento HTML optimizado para SEO y redes sociales de un recurso gratuito
+    (título SEO, meta description, palabras clave, Schema.org Article + BreadcrumbList JSON-LD,
+    Open Graph, Twitter Card y contenido semántico del teaser y aprendizajes clave) para
+    crawlers de buscadores (Googlebot, Bingbot, Applebot, GPTBot, PerplexityBot) y redes sociales
     (Instagram DM, WhatsApp, Facebook/Meta, Telegram, X/Twitter, LinkedIn).
     """
-    res = PublicResource.query.filter_by(slug=slug_or_id).first()
-    if not res and slug_or_id.isdigit():
-        res = PublicResource.query.get(int(slug_or_id))
+    res = None
+    try:
+        res = PublicResource.query.filter_by(slug=slug_or_id).first()
+        if not res and slug_or_id.isdigit():
+            res = PublicResource.query.get(int(slug_or_id))
+    except Exception:
+        res = None
 
     proto = (request.headers.get("X-Forwarded-Proto") or request.scheme or "https").split(",")[0].strip()
     host = (request.headers.get("X-Forwarded-Host") or request.host or "api.carlaviladotpsicologia.com").split(",")[0].strip()
@@ -2796,27 +2802,172 @@ def public_resource_og_html(slug_or_id: str):
         proto = "https"
     api_base = f"{proto}://{host}"
 
-    title_str = "Vuelve a Ti | Programa de 10 semanas para superar tu ruptura"
+    site_name = "Carla Viladot Psicóloga · Programa Vuelve a Ti"
+    article_body_html = ""
+    json_ld_script = ""
+
     if res and res.is_published:
+        custom_title = (res.meta_title or "").strip()
+        title_str = (
+            custom_title
+            if custom_title
+            else f"{res.title} · Recurso Gratuito | Carla Viladot Psicóloga"
+        )
         raw_desc = (
-            res.subtitle
+            (res.meta_description or "").strip()
+            or res.subtitle
             or res.teaser_text
-            or "Programa de 10 semanas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
+            or "Guía clínica y recurso terapéutico gratuito para superar una ruptura de pareja y regular la ansiedad. Por Carla Viladot Psicóloga."
         )
         clean_desc = re.sub(r"\s+", " ", raw_desc).strip()
-        if len(clean_desc) > 220:
-            clean_desc = clean_desc[:217].rstrip() + "..."
+        if len(clean_desc) > 200:
+            clean_desc = clean_desc[:197].rstrip() + "..."
+
+        keywords_str = (res.seo_keywords or "").strip() or (
+            f"{res.title}, {res.category or 'duelo afectivo'}, terapia ruptura de pareja, "
+            "superar una ruptura, contacto cero, psicóloga ruptura amorosa, Carla Viladot, Vuelve a Ti"
+        )
         canonical_url = f"https://www.carlaviladotpsicologia.com/recursos/{res.slug}"
         image_url = f"{api_base}/api/og/resources/{res.slug}/cover.jpg"
+
+        # Construir contenido semántico abierto (Teaser + Puntos clave) para indexación de buscadores
+        res_dict = res.to_dict(unlocked=False)
+        teaser_paragraphs = [
+            f"<p>{html.escape(p.strip())}</p>"
+            for p in (res.teaser_text or "").split("\n\n")
+            if p.strip()
+        ]
+        takeaways_items = [
+            f"<li>{html.escape(str(k).strip())}</li>"
+            for k in (res_dict.get("key_takeaways") or [])
+            if str(k).strip()
+        ]
+        takeaways_html = (
+            f"<h2>Qué aprenderás en este recurso terapéutico</h2><ul>{''.join(takeaways_items)}</ul>"
+            if takeaways_items
+            else ""
+        )
+        subtitle_html = (
+            f"<h2>{html.escape(res.subtitle.strip())}</h2>"
+            if (res.subtitle or "").strip()
+            else ""
+        )
+
+        article_body_html = f"""
+    <main>
+      <nav aria-label="Breadcrumb">
+        <a href="https://www.carlaviladotpsicologia.com/">Inicio · Terapia Ruptura de Pareja</a> &rsaquo;
+        <a href="https://www.carlaviladotpsicologia.com/recursos">Recursos Gratuitos</a> &rsaquo;
+        <span>{html.escape(res.title)}</span>
+      </nav>
+      <article>
+        <header>
+          <p>{html.escape(res.category or 'Psicología y Duelo Afectivo')} · Lectura de {int(res.read_time_minutes or 5)} min</p>
+          <h1>{html.escape(res.title)}</h1>
+          {subtitle_html}
+          <p>Por <strong>Carla Viladot</strong> · Psicóloga Sanitaria (Col. 29332) especialista en ruptura de pareja, apego y regulación emocional.</p>
+        </header>
+        <section>
+          {''.join(teaser_paragraphs)}
+        </section>
+        {takeaways_html}
+        <footer>
+          <p><a href="{html.escape(canonical_url, quote=True)}">Desbloquear y leer el recurso completo con cuaderno PDF gratuito en Vuelve a Ti</a></p>
+        </footer>
+      </article>
+    </main>"""
+
+        pub_iso = (
+            res.created_at.replace(tzinfo=timezone.utc).isoformat()
+            if res.created_at
+            else datetime.now(timezone.utc).isoformat()
+        )
+        mod_iso = (
+            res.updated_at.replace(tzinfo=timezone.utc).isoformat()
+            if res.updated_at
+            else pub_iso
+        )
+
+        schema_data = {
+            "@context": "https://schema.org",
+            "@graph": [
+                {
+                    "@type": "Article",
+                    "@id": f"{canonical_url}#article",
+                    "headline": res.title,
+                    "description": clean_desc,
+                    "image": [image_url],
+                    "articleSection": res.category or "Ruptura de Pareja y Regulación Emocional",
+                    "keywords": keywords_str,
+                    "inLanguage": "es-ES",
+                    "datePublished": pub_iso,
+                    "dateModified": mod_iso,
+                    "isAccessibleForFree": True,
+                    "author": {
+                        "@type": "Person",
+                        "name": "Carla Viladot",
+                        "jobTitle": "Psicóloga Sanitaria (Col. 29332)",
+                        "url": "https://www.carlaviladotpsicologia.com/",
+                    },
+                    "publisher": {
+                        "@type": "Organization",
+                        "name": "Carla Viladot Psicología · Programa Vuelve a Ti",
+                        "url": "https://www.carlaviladotpsicologia.com/",
+                        "logo": {
+                            "@type": "ImageObject",
+                            "url": DEFAULT_OG_FALLBACK_IMAGE,
+                        },
+                    },
+                    "mainEntityOfPage": {
+                        "@type": "WebPage",
+                        "@id": canonical_url,
+                    },
+                },
+                {
+                    "@type": "BreadcrumbList",
+                    "itemListElement": [
+                        {
+                            "@type": "ListItem",
+                            "position": 1,
+                            "name": "Inicio",
+                            "item": "https://www.carlaviladotpsicologia.com/",
+                        },
+                        {
+                            "@type": "ListItem",
+                            "position": 2,
+                            "name": "Recursos Gratuitos",
+                            "item": "https://www.carlaviladotpsicologia.com/recursos",
+                        },
+                        {
+                            "@type": "ListItem",
+                            "position": 3,
+                            "name": res.title,
+                            "item": canonical_url,
+                        },
+                    ],
+                },
+            ],
+        }
+        json_ld_script = f'<script type="application/ld+json">{json.dumps(schema_data, ensure_ascii=False)}</script>'
     else:
-        clean_desc = "Programa de 10 semanas para superar la ruptura y reencontrarte. Acompañado por Carla Viladot Psicóloga."
+        title_str = "Recursos Gratuitos para Superar una Ruptura | Carla Viladot Psicóloga"
+        clean_desc = "Guías prácticas, ejercicios de contacto cero, regulación de ansiedad y cuadernos PDF gratuitos por Carla Viladot Psicóloga."
+        keywords_str = "recursos gratuitos ruptura de pareja, contacto cero pdf, superar ruptura amorosa, Carla Viladot Psicóloga"
         canonical_url = "https://www.carlaviladotpsicologia.com/recursos"
         image_url = DEFAULT_OG_FALLBACK_IMAGE
+        article_body_html = f"""
+    <main>
+      <h1>{html.escape(title_str)}</h1>
+      <p>{html.escape(clean_desc)}</p>
+      <p><a href="{html.escape(canonical_url, quote=True)}">Ver biblioteca de recursos gratuitos</a></p>
+    </main>"""
 
     esc_title = html.escape(title_str, quote=True)
     esc_desc = html.escape(clean_desc, quote=True)
+    esc_kw = html.escape(keywords_str, quote=True)
     esc_url = html.escape(canonical_url, quote=True)
     esc_img = html.escape(image_url, quote=True)
+    esc_site = html.escape(site_name, quote=True)
 
     html_doc = f"""<!DOCTYPE html>
 <html lang="es">
@@ -2825,12 +2976,15 @@ def public_resource_og_html(slug_or_id: str):
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>{esc_title}</title>
     <meta name="description" content="{esc_desc}" />
+    <meta name="keywords" content="{esc_kw}" />
+    <meta name="author" content="Carla Viladot · Psicóloga Sanitaria Col. 29332" />
+    <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
     <link rel="canonical" href="{esc_url}" />
 
     <!-- Open Graph / Instagram DM / WhatsApp / Facebook -->
     <meta property="og:type" content="article" />
     <meta property="og:locale" content="es_ES" />
-    <meta property="og:site_name" content="{esc_title}" />
+    <meta property="og:site_name" content="{esc_site}" />
     <meta property="og:title" content="{esc_title}" />
     <meta property="og:description" content="{esc_desc}" />
     <meta property="og:url" content="{esc_url}" />
@@ -2844,16 +2998,124 @@ def public_resource_og_html(slug_or_id: str):
     <meta name="twitter:title" content="{esc_title}" />
     <meta name="twitter:description" content="{esc_desc}" />
     <meta name="twitter:image" content="{esc_img}" />
+
+    {json_ld_script}
   </head>
   <body>
-    <h1>{esc_title}</h1>
-    <p>{esc_desc}</p>
-    <p><a href="{esc_url}">Acceder al recurso gratuito</a></p>
+    {article_body_html}
   </body>
 </html>"""
 
     resp = Response(html_doc, status=200, mimetype="text/html; charset=utf-8")
     resp.headers["Cache-Control"] = "public, max-age=300"
+    return resp
+
+
+@api_bp.route("/seo/sitemap.xml", methods=["GET"])
+def public_seo_sitemap():
+    """
+    Genera dinámicamente el Sitemap XML oficial para Google Search Console y Bing Webmaster Tools.
+    Incluye la Landing principal, el Foro de Recursos (/recursos), cada recurso gratuito publicado
+    con su fecha real de actualización e imagen de portada (<image:image>), y las páginas legales.
+    """
+    base_url = "https://www.carlaviladotpsicologia.com"
+    api_url = "https://api.carlaviladotpsicologia.com"
+    now_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    try:
+        published_resources = (
+            PublicResource.query.filter_by(is_published=True)
+            .order_by(PublicResource.is_featured.desc(), PublicResource.updated_at.desc())
+            .all()
+        )
+    except Exception:
+        published_resources = []
+
+    latest_res_date = now_iso
+    if published_resources:
+        first_dt = published_resources[0].updated_at or published_resources[0].created_at
+        if first_dt:
+            latest_res_date = first_dt.strftime("%Y-%m-%d")
+
+    urls_xml = [
+        f"""  <url>
+    <loc>{base_url}/</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>1.0</priority>
+    <image:image>
+      <image:loc>{base_url}/images/carla-viladot.jpg</image:loc>
+      <image:title>Carla Viladot · Psicóloga especialista en ruptura de pareja y duelo afectivo</image:title>
+    </image:image>
+  </url>""",
+        f"""  <url>
+    <loc>{base_url}/recursos</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>daily</changefreq>
+    <priority>0.9</priority>
+  </url>""",
+    ]
+
+    for res in published_resources:
+        dt = res.updated_at or res.created_at
+        lastmod_str = dt.strftime("%Y-%m-%d") if dt else now_iso
+        loc_url = html.escape(f"{base_url}/recursos/{res.slug}")
+        img_url = html.escape(f"{api_url}/api/og/resources/{res.slug}/cover.jpg")
+        img_title = html.escape(res.title)
+        urls_xml.append(
+            f"""  <url>
+    <loc>{loc_url}</loc>
+    <lastmod>{lastmod_str}</lastmod>
+    <changefreq>weekly</changefreq>
+    <priority>0.85</priority>
+    <image:image>
+      <image:loc>{img_url}</image:loc>
+      <image:title>{img_title}</image:title>
+    </image:image>
+  </url>"""
+        )
+
+    for legal_path in ("/aviso-legal", "/privacidad", "/cookies"):
+        urls_xml.append(
+            f"""  <url>
+    <loc>{base_url}{legal_path}</loc>
+    <lastmod>{now_iso}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.3</priority>
+  </url>"""
+        )
+
+    xml_doc = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"\n'
+        '        xmlns:image="http://www.google.com/schemas/sitemap-image/1.1">\n'
+        + "\n".join(urls_xml)
+        + "\n</urlset>\n"
+    )
+
+    resp = Response(xml_doc, status=200, mimetype="application/xml; charset=utf-8")
+    resp.headers["Cache-Control"] = "public, max-age=600"
+    return resp
+
+
+@api_bp.route("/seo/robots.txt", methods=["GET"])
+def public_seo_robots():
+    """Devuelve el archivo robots.txt optimizado para buscadores."""
+    robots_txt = (
+        "User-agent: *\n"
+        "Allow: /\n"
+        "Allow: /recursos\n"
+        "Allow: /recursos/\n"
+        "Disallow: /admin\n"
+        "Disallow: /admin/\n"
+        "Disallow: /dashboard\n"
+        "Disallow: /login\n"
+        "Disallow: /api/admin/\n"
+        "Disallow: /api/auth/\n\n"
+        "Sitemap: https://www.carlaviladotpsicologia.com/sitemap.xml\n"
+    )
+    resp = Response(robots_txt, status=200, mimetype="text/plain; charset=utf-8")
+    resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
 
 
@@ -2966,6 +3228,13 @@ def _apply_resource_payload(res: PublicResource, data: dict) -> None:
         res.pdf_original_name = (data.get("pdf_original_name") or "").strip()
     if "pdf_file_size_bytes" in data:
         res.pdf_file_size_bytes = int(data.get("pdf_file_size_bytes") or 0)
+
+    if "meta_title" in data:
+        res.meta_title = (data.get("meta_title") or "").strip()[:255]
+    if "meta_description" in data:
+        res.meta_description = (data.get("meta_description") or "").strip()[:350]
+    if "seo_keywords" in data:
+        res.seo_keywords = (data.get("seo_keywords") or "").strip()[:400]
 
 
 @api_bp.route("/admin/public-resources", methods=["POST"])

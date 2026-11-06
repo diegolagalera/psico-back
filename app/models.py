@@ -682,6 +682,11 @@ class PublicResource(db.Model):
     pdf_original_name = db.Column(db.String(255), nullable=True, default="")
     pdf_file_size_bytes = db.Column(db.BigInteger, nullable=False, default=0)
 
+    # SEO opcional (si están vacíos, se autogeneran desde title, subtitle y teaser_text)
+    meta_title = db.Column(db.String(255), nullable=True, default="")
+    meta_description = db.Column(db.String(350), nullable=True, default="")
+    seo_keywords = db.Column(db.String(400), nullable=True, default="")
+
     # Analítica
     views_count = db.Column(db.Integer, nullable=False, default=0)
     unlocks_count = db.Column(db.Integer, nullable=False, default=0)
@@ -751,6 +756,9 @@ class PublicResource(db.Model):
             "audio_title": self.audio_title or self.audio_original_name or "Audio guiado del recurso",
             "pdf_title": self.pdf_title or self.pdf_original_name or "Cuaderno Práctico Descargable (PDF)",
             "pdf_file_size_bytes": int(self.pdf_file_size_bytes or 0),
+            "meta_title": self.meta_title or "",
+            "meta_description": self.meta_description or "",
+            "seo_keywords": self.seo_keywords or "",
             "views_count": int(self.views_count or 0),
             "unlocks_count": int(self.unlocks_count or 0),
             "is_unlocked": bool(unlocked),

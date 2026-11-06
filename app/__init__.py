@@ -84,6 +84,23 @@ def ensure_mysql_database_exists() -> None:
                     cursor.execute(
                         "ALTER TABLE `lessons` ADD COLUMN `booking_enabled` TINYINT(1) NOT NULL DEFAULT 0;"
                     )
+
+            # Columnas SEO opcionales en public_resources
+            cursor.execute("SHOW TABLES LIKE 'public_resources';")
+            if cursor.fetchone():
+                seo_cols = [
+                    ("meta_title", "VARCHAR(255) DEFAULT ''"),
+                    ("meta_description", "VARCHAR(350) DEFAULT ''"),
+                    ("seo_keywords", "VARCHAR(400) DEFAULT ''"),
+                ]
+                for col_name, col_def in seo_cols:
+                    cursor.execute(
+                        f"SHOW COLUMNS FROM `public_resources` LIKE '{col_name}';"
+                    )
+                    if not cursor.fetchone():
+                        cursor.execute(
+                            f"ALTER TABLE `public_resources` ADD COLUMN `{col_name}` {col_def};"
+                        )
         conn.commit()
         conn.close()
     except Exception as exc:
@@ -565,6 +582,18 @@ def create_app() -> Flask:
     @app.route("/api/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "service": "Vuelve a Ti API"}), 200
+
+    @app.route("/sitemap.xml", methods=["GET"])
+    def root_sitemap():
+        from app.routes import public_seo_sitemap
+
+        return public_seo_sitemap()
+
+    @app.route("/robots.txt", methods=["GET"])
+    def root_robots():
+        from app.routes import public_seo_robots
+
+        return public_seo_robots()
 
     with app.app_context():
         ensure_mysql_database_exists()
