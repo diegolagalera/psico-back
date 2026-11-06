@@ -109,6 +109,81 @@ def ensure_mysql_database_exists() -> None:
         )
 
 
+_SCHEMA_COLUMNS_MIGRATED = False
+
+
+def ensure_schema_columns_via_sqlalchemy() -> bool:
+    """
+    Asegura que todas las columnas nuevas (como meta_title, meta_description y seo_keywords
+    en `public_resources`, `booking_enabled` en `lessons` y ajustes en `system_config`)
+    existan usando directamente el motor activo de SQLAlchemy (`db.engine`), que en producción
+    (Railway / Docker) se conecta mediante `DATABASE_URL` o `MYSQL_URL`.
+    """
+    global _SCHEMA_COLUMNS_MIGRATED
+    if _SCHEMA_COLUMNS_MIGRATED:
+        return True
+
+    try:
+        from sqlalchemy import inspect, text
+
+        inspector = inspect(db.engine)
+        existing_tables = set(inspector.get_table_names())
+
+        migrations = {
+            "public_resources": [
+                ("meta_title", "VARCHAR(255) DEFAULT ''"),
+                ("meta_description", "VARCHAR(350) DEFAULT ''"),
+                ("seo_keywords", "VARCHAR(400) DEFAULT ''"),
+            ],
+            "lessons": [
+                ("booking_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
+            ],
+            "system_config": [
+                ("s3_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
+                ("s3_provider", "VARCHAR(50) DEFAULT 'cloudflare_r2'"),
+                ("s3_endpoint_url", "VARCHAR(255) DEFAULT ''"),
+                ("s3_region", "VARCHAR(80) DEFAULT 'auto'"),
+                ("s3_bucket_name", "VARCHAR(150) DEFAULT ''"),
+                ("s3_access_key_id", "VARCHAR(255) DEFAULT ''"),
+                ("s3_secret_access_key", "VARCHAR(255) DEFAULT ''"),
+                ("presigned_url_expiration", "INT DEFAULT 1800"),
+                ("calendar_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
+                ("calendar_use_gmail_token", "TINYINT(1) NOT NULL DEFAULT 1"),
+                ("calendar_token_json", "LONGTEXT NULL"),
+                ("calendar_id", "VARCHAR(255) DEFAULT 'primary'"),
+                ("calendar_timezone", "VARCHAR(64) DEFAULT 'Europe/Madrid'"),
+                ("session_duration_minutes", "INT DEFAULT 60"),
+                ("booking_working_hours", "TEXT NULL"),
+                ("booking_min_notice_hours", "INT DEFAULT 24"),
+                ("booking_cancel_limit_hours", "INT DEFAULT 24"),
+            ],
+        }
+
+        for table_name, cols in migrations.items():
+            if table_name not in existing_tables:
+                continue
+            existing_cols = {c["name"] for c in inspector.get_columns(table_name)}
+            for col_name, col_def in cols:
+                if col_name not in existing_cols:
+                    try:
+                        with db.engine.begin() as conn:
+                            conn.execute(
+                                text(
+                                    f"ALTER TABLE `{table_name}` ADD COLUMN `{col_name}` {col_def};"
+                                )
+                            )
+                    except Exception as alter_exc:
+                        # Ignorar si otro worker de Gunicorn ya creó la columna en paralelo (error 1060 Duplicate column)
+                        if "1060" not in str(alter_exc) and "Duplicate column" not in str(alter_exc):
+                            print(f"[AVISO MIGRACION] {table_name}.{col_name}: {alter_exc}")
+
+        _SCHEMA_COLUMNS_MIGRATED = True
+        return True
+    except Exception as exc:
+        print(f"[AVISO MIGRACION SQLAlchemy] {exc}")
+        return False
+
+
 def _create_sample_pdf_bytes(title: str, subtitle: str) -> bytes:
     """Genera un documento PDF real válido para los cuadernos de ejercicios iniciales."""
     safe_title = title.encode("latin-1", errors="ignore").decode("latin-1")
@@ -595,10 +670,16 @@ def create_app() -> Flask:
 
         return public_seo_robots()
 
+    @app.before_request
+    def _ensure_columns_on_first_request():
+        if not _SCHEMA_COLUMNS_MIGRATED:
+            ensure_schema_columns_via_sqlalchemy()
+
     with app.app_context():
         ensure_mysql_database_exists()
         try:
             db.create_all()
+            ensure_schema_columns_via_sqlalchemy()
             seed_initial_data()
             seed_marketing_defaults()
         except Exception as exc:
