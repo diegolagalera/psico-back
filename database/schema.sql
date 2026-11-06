@@ -201,4 +201,125 @@ CREATE TABLE IF NOT EXISTS `session_bookings` (
   CONSTRAINT `fk_booking_course` FOREIGN KEY (`course_id`) REFERENCES `courses`(`id`) ON DELETE SET NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
 
+-- 13. Módulo Independiente de Email Marketing: Plantillas HTML
+CREATE TABLE IF NOT EXISTS `marketing_templates` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(200) NOT NULL,
+  `subject` VARCHAR(255) NOT NULL DEFAULT '',
+  `preheader` VARCHAR(255) NULL DEFAULT '',
+  `category` VARCHAR(60) NOT NULL DEFAULT 'general',
+  `original_filename` VARCHAR(255) NULL DEFAULT '',
+  `html_content` MEDIUMTEXT NOT NULL,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 14. Módulo Email Marketing: Grupos de Correos
+CREATE TABLE IF NOT EXISTS `marketing_groups` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(180) NOT NULL,
+  `description` VARCHAR(350) NULL DEFAULT '',
+  `color` VARCHAR(30) NULL DEFAULT '#4A6B5D',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 15. Módulo Email Marketing: Miembros de Grupos
+CREATE TABLE IF NOT EXISTS `marketing_group_members` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `group_id` INT NOT NULL,
+  `email` VARCHAR(180) NOT NULL,
+  `name` VARCHAR(140) NULL DEFAULT '',
+  `source_type` VARCHAR(40) NOT NULL DEFAULT 'manual',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY `uq_marketing_group_email` (`group_id`, `email`),
+  CONSTRAINT `fk_mgroup_member_group` FOREIGN KEY (`group_id`) REFERENCES `marketing_groups`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 16. Módulo Email Marketing: Campañas Programadas e Inmediatas
+CREATE TABLE IF NOT EXISTS `marketing_campaigns` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `name` VARCHAR(220) NOT NULL,
+  `subject` VARCHAR(255) NOT NULL,
+  `preheader` VARCHAR(255) NULL DEFAULT '',
+  `template_id` INT NULL,
+  `html_content` MEDIUMTEXT NOT NULL,
+  `target_type` VARCHAR(40) NOT NULL DEFAULT 'leads',
+  `target_groups_json` TEXT NULL,
+  `target_emails_json` TEXT NULL,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'draft',
+  `scheduled_at` DATETIME NULL,
+  `started_at` DATETIME NULL,
+  `completed_at` DATETIME NULL,
+  `total_recipients` INT NOT NULL DEFAULT 0,
+  `sent_count` INT NOT NULL DEFAULT 0,
+  `failed_count` INT NOT NULL DEFAULT 0,
+  `opened_count` INT NOT NULL DEFAULT 0,
+  `api_base_url` VARCHAR(255) NULL DEFAULT '',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT `fk_mcamp_template` FOREIGN KEY (`template_id`) REFERENCES `marketing_templates`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 17. Módulo Email Marketing: Destinatarios y Píxel de Apertura por Campaña
+CREATE TABLE IF NOT EXISTS `marketing_campaign_recipients` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `campaign_id` INT NOT NULL,
+  `email` VARCHAR(180) NOT NULL,
+  `name` VARCHAR(140) NULL DEFAULT '',
+  `tracking_token` VARCHAR(64) NOT NULL UNIQUE,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'pending',
+  `sent_at` DATETIME NULL,
+  `opened_at` DATETIME NULL,
+  `last_opened_at` DATETIME NULL,
+  `open_count` INT NOT NULL DEFAULT 0,
+  `user_agent` VARCHAR(300) NULL DEFAULT '',
+  `error_message` TEXT NULL,
+  UNIQUE KEY `uq_campaign_recipient_email` (`campaign_id`, `email`),
+  CONSTRAINT `fk_mrec_campaign` FOREIGN KEY (`campaign_id`) REFERENCES `marketing_campaigns`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 18. Módulo Email Marketing: Pasos de Secuencia Automática (24h, 48h, 72h)
+CREATE TABLE IF NOT EXISTS `marketing_automation_steps` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `step_order` INT NOT NULL DEFAULT 1,
+  `title` VARCHAR(200) NOT NULL,
+  `delay_hours` INT NOT NULL DEFAULT 24,
+  `subject` VARCHAR(255) NOT NULL,
+  `preheader` VARCHAR(255) NULL DEFAULT '',
+  `template_id` INT NULL,
+  `original_filename` VARCHAR(255) NULL DEFAULT '',
+  `html_content` MEDIUMTEXT NOT NULL,
+  `is_active` TINYINT(1) NOT NULL DEFAULT 1,
+  `total_sent` INT NOT NULL DEFAULT 0,
+  `total_opened` INT NOT NULL DEFAULT 0,
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  CONSTRAINT `fk_mauto_template` FOREIGN KEY (`template_id`) REFERENCES `marketing_templates`(`id`) ON DELETE SET NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- 19. Módulo Email Marketing: Cola de Envíos y Aperturas de la Secuencia (24h, 48h, 72h)
+CREATE TABLE IF NOT EXISTS `marketing_automation_queue` (
+  `id` INT AUTO_INCREMENT PRIMARY KEY,
+  `step_id` INT NOT NULL,
+  `lead_id` INT NULL,
+  `email` VARCHAR(180) NOT NULL,
+  `name` VARCHAR(140) NULL DEFAULT '',
+  `resource_title` VARCHAR(220) NULL DEFAULT '',
+  `delay_hours` INT NOT NULL DEFAULT 24,
+  `scheduled_for` DATETIME NOT NULL,
+  `status` VARCHAR(30) NOT NULL DEFAULT 'pending',
+  `tracking_token` VARCHAR(64) NOT NULL UNIQUE,
+  `sent_at` DATETIME NULL,
+  `opened_at` DATETIME NULL,
+  `last_opened_at` DATETIME NULL,
+  `open_count` INT NOT NULL DEFAULT 0,
+  `user_agent` VARCHAR(300) NULL DEFAULT '',
+  `error_message` TEXT NULL,
+  `api_base_url` VARCHAR(255) NULL DEFAULT '',
+  `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE KEY `uq_auto_step_email` (`step_id`, `email`),
+  CONSTRAINT `fk_mqueue_step` FOREIGN KEY (`step_id`) REFERENCES `marketing_automation_steps`(`id`) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
 

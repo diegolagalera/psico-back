@@ -20,6 +20,9 @@ from app.models import (
 )
 from app.routes import api_bp
 from app.storage_service import ensure_protected_storage_dir
+import app.marketing_models  # noqa: F401
+from app.marketing_routes import marketing_bp
+from app.marketing_service import seed_marketing_defaults, start_marketing_scheduler
 
 jwt = JWTManager()
 
@@ -557,6 +560,7 @@ def create_app() -> Flask:
     jwt.init_app(app)
 
     app.register_blueprint(api_bp, url_prefix="/api")
+    app.register_blueprint(marketing_bp, url_prefix="/api")
 
     @app.route("/api/health", methods=["GET"])
     def health():
@@ -567,9 +571,15 @@ def create_app() -> Flask:
         try:
             db.create_all()
             seed_initial_data()
+            seed_marketing_defaults()
         except Exception as exc:
             print(
                 f"[AVISO SQLAlchemy] Revisa que MySQL 8.0 esté en ejecución con la BD '{Config.DB_NAME}': {exc}"
             )
+
+    try:
+        start_marketing_scheduler(app)
+    except Exception as exc:
+        print(f"[AVISO MARKETING SCHEDULER] {exc}")
 
     return app

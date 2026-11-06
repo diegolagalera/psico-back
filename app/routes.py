@@ -2608,6 +2608,13 @@ def public_unlock_resource(slug_or_id: str):
 
     if is_new_lead:
         try:
+            from app.marketing_service import enqueue_new_lead_automation
+
+            enqueue_new_lead_automation(lead=lead, resource_title=res.title)
+        except Exception:
+            pass
+
+        try:
             lead_html = build_new_lead_notification_html(
                 email=email_clean,
                 name=name_clean,
