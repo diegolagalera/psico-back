@@ -654,6 +654,14 @@ def create_app() -> Flask:
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(marketing_bp, url_prefix="/api")
 
+    @app.route("/", methods=["GET"])
+    def root_index():
+        from flask import redirect
+
+        resp = redirect("https://www.carlaviladotpsicologia.com/", code=301)
+        resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+        return resp
+
     @app.route("/api/health", methods=["GET"])
     def health():
         return jsonify({"status": "ok", "service": "Vuelve a Ti API"}), 200

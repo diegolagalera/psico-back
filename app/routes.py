@@ -3100,20 +3100,30 @@ def public_seo_sitemap():
 
 @api_bp.route("/seo/robots.txt", methods=["GET"])
 def public_seo_robots():
-    """Devuelve el archivo robots.txt optimizado para buscadores."""
-    robots_txt = (
-        "User-agent: *\n"
-        "Allow: /\n"
-        "Allow: /recursos\n"
-        "Allow: /recursos/\n"
-        "Disallow: /admin\n"
-        "Disallow: /admin/\n"
-        "Disallow: /dashboard\n"
-        "Disallow: /login\n"
-        "Disallow: /api/admin/\n"
-        "Disallow: /api/auth/\n\n"
-        "Sitemap: https://www.carlaviladotpsicologia.com/sitemap.xml\n"
-    )
+    """Devuelve el archivo robots.txt optimizado según el subdominio (API vs Web)."""
+    host = (request.host or "").lower()
+    if host.startswith("api."):
+        robots_txt = (
+            "User-agent: *\n"
+            "Allow: /api/og/\n"
+            "Allow: /api/seo/\n"
+            "Disallow: /\n\n"
+            "Sitemap: https://www.carlaviladotpsicologia.com/sitemap.xml\n"
+        )
+    else:
+        robots_txt = (
+            "User-agent: *\n"
+            "Allow: /\n"
+            "Allow: /recursos\n"
+            "Allow: /recursos/\n"
+            "Disallow: /admin\n"
+            "Disallow: /admin/\n"
+            "Disallow: /dashboard\n"
+            "Disallow: /login\n"
+            "Disallow: /api/admin/\n"
+            "Disallow: /api/auth/\n\n"
+            "Sitemap: https://www.carlaviladotpsicologia.com/sitemap.xml\n"
+        )
     resp = Response(robots_txt, status=200, mimetype="text/plain; charset=utf-8")
     resp.headers["Cache-Control"] = "public, max-age=3600"
     return resp
