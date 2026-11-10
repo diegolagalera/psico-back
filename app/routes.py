@@ -66,6 +66,7 @@ from app.storage_service import (
     get_storage_config,
     is_s3_ready,
     sanitize_filename,
+    store_uploaded_filepath,
     store_uploaded_media,
     test_s3_connection,
     create_media_access_token,
@@ -676,26 +677,8 @@ def presign_direct_upload():
     )
 
 
-@api_bp.route("/admin/storage/upload", methods=["POST"])
-@admin_required
-def upload_media_endpoint():
-    """
-    Recibe un archivo (vídeo o recurso PDF/Word/Presentación/Audio) desde el panel Admin
-    y lo sube a Cloudflare R2 / S3 (si está configurado) o al almacenamiento protegido local.
-    """
-    if "file" not in request.files:
-        return jsonify({"error": "No se ha enviado ningún archivo."}), 400
-
-    file_obj = request.files["file"]
-    if not file_obj or not file_obj.filename:
-        return jsonify({"error": "El archivo seleccionado no es válido."}), 400
-
-    folder = (request.form.get("folder") or "courses/media").strip("/")
-    ok, meta, log_msg = store_uploaded_media(file_obj, folder_prefix=folder)
-    if not ok:
-        return jsonify({"error": log_msg}), 400
-
-    # Generar URL firmada de previsualización inmediata para el editor en vivo
+def _attach_preview_url_to_media(meta: dict) -> None:
+    """Genera e inyecta la URL firmada de previsualización inmediata en `meta['preview_url']`."""
     try:
         cfg = get_storage_config()
         if meta.get("storage_provider") == "s3" and is_s3_ready(cfg):
@@ -720,9 +703,102 @@ def upload_media_endpoint():
     except Exception:
         meta["preview_url"] = ""
 
+
+@api_bp.route("/admin/storage/upload", methods=["POST"])
+@admin_required
+def upload_media_endpoint():
+    """
+    Recibe un archivo (vídeo o recurso PDF/Word/Presentación/Audio) desde el panel Admin
+    y lo sube a Cloudflare R2 / S3 (si está configurado) o al almacenamiento protegido local.
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No se ha enviado ningún archivo."}), 400
+
+    file_obj = request.files["file"]
+    if not file_obj or not file_obj.filename:
+        return jsonify({"error": "El archivo seleccionado no es válido."}), 400
+
+    folder = (request.form.get("folder") or "courses/media").strip("/")
+    ok, meta, log_msg = store_uploaded_media(file_obj, folder_prefix=folder)
+    if not ok:
+        return jsonify({"error": log_msg}), 400
+
+    _attach_preview_url_to_media(meta)
+
     return (
         jsonify(
             {
+                "message": log_msg,
+                "media": meta,
+            }
+        ),
+        201,
+    )
+
+
+@api_bp.route("/admin/storage/upload-chunk", methods=["POST"])
+@admin_required
+def upload_media_chunk_endpoint():
+    """
+    Subida por fragmentos (Chunked Upload) de 5 MB para vídeos pesados o audios largos.
+    Evita errores 413 Payload Too Large y cortes por timeout en Cloudflare / Traefik / Nginx.
+    """
+    chunk_file = request.files.get("chunk") or request.files.get("file")
+    if not chunk_file:
+        return jsonify({"error": "No se ha recibido el fragmento del archivo."}), 400
+
+    raw_upload_id = (request.form.get("upload_id") or "").strip()
+    safe_upload_id = re.sub(r"[^a-zA-Z0-9_-]", "", raw_upload_id)[:80]
+    if not safe_upload_id:
+        return jsonify({"error": "Falta upload_id válido."}), 400
+
+    try:
+        chunk_index = int(request.form.get("chunk_index", 0))
+        total_chunks = int(request.form.get("total_chunks", 1))
+    except ValueError:
+        return jsonify({"error": "Índices de fragmento inválidos."}), 400
+
+    filename = request.form.get("filename") or chunk_file.filename or "video.mp4"
+    mime_type = request.form.get("mime_type") or chunk_file.mimetype or "video/mp4"
+    folder = (request.form.get("folder") or "public_resources/videos").strip("/")
+
+    base_dir = ensure_protected_storage_dir()
+    chunks_dir = os.path.join(base_dir, ".chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+    part_path = os.path.join(chunks_dir, f"chunk_{safe_upload_id}.part")
+
+    mode = "wb" if chunk_index == 0 else "ab"
+    with open(part_path, mode) as out_fh:
+        chunk_bytes = chunk_file.read()
+        out_fh.write(chunk_bytes)
+
+    if chunk_index + 1 < total_chunks:
+        return (
+            jsonify(
+                {
+                    "completed": False,
+                    "chunk_index": chunk_index,
+                    "total_chunks": total_chunks,
+                }
+            ),
+            200,
+        )
+
+    ok, meta, log_msg = store_uploaded_filepath(
+        file_path=part_path,
+        original_filename=filename,
+        mime_type=mime_type,
+        folder_prefix=folder,
+    )
+    if not ok:
+        return jsonify({"error": log_msg}), 400
+
+    _attach_preview_url_to_media(meta)
+
+    return (
+        jsonify(
+            {
+                "completed": True,
                 "message": log_msg,
                 "media": meta,
             }

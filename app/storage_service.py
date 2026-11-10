@@ -475,61 +475,139 @@ def open_trusted_s3_url(url: str, timeout: int = 30):
     return urllib.request.urlopen(req, timeout=timeout, context=_get_ssl_context())
 
 
-def store_uploaded_media(
-    file_storage,
+def upload_filepath_to_s3(
+    file_path: str,
+    object_key: str,
+    content_type: str = "application/octet-stream",
+    cfg: dict | None = None,
+) -> tuple[bool, str]:
+    """
+    Sube un archivo en disco mediante streaming directo al bucket S3 / Cloudflare R2
+    usando una URL firmada PUT s3v4 sin cargar todo el vídeo en memoria RAM.
+    """
+    try:
+        file_size = os.path.getsize(file_path)
+        put_url = generate_s3_presigned_url(
+            method="PUT",
+            object_key=object_key,
+            expires_in=3600,
+            cfg=cfg,
+        )
+        with open(file_path, "rb") as fh:
+            req = urllib.request.Request(
+                put_url,
+                data=fh,
+                method="PUT",
+                headers={
+                    "Content-Type": content_type or "application/octet-stream",
+                    "Content-Length": str(file_size),
+                    "User-Agent": "VuelveATi-Storage/1.0",
+                },
+            )
+            with urllib.request.urlopen(
+                req, timeout=600, context=_get_ssl_context()
+            ) as resp:
+                status = resp.status
+                if 200 <= status < 300:
+                    return True, f"Archivo subido correctamente a S3/R2 ({object_key})"
+                return False, f"Respuesta inesperada de S3/R2: HTTP {status}"
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", errors="ignore")[:500]
+        except Exception:
+            pass
+        return False, f"Error HTTP {exc.code} al subir a S3/R2: {exc.reason}. {body}"
+    except Exception as exc:
+        return False, f"Error de conexión con S3/R2: {exc}"
+
+
+def store_uploaded_filepath(
+    file_path: str,
+    original_filename: str,
+    mime_type: str = "application/octet-stream",
     folder_prefix: str = "courses",
 ) -> tuple[bool, dict, str]:
     """
-    Guarda un archivo subido desde el panel Admin:
-    - Si S3 / Cloudflare R2 está activo y configurado, lo sube directamente al bucket S3 privado.
-    - Si aún no está activo S3, lo guarda en la carpeta protegida del servidor (`protected_media/`)
-      para que todo funcione sin interrupciones mientras se configura Cloudflare R2.
+    Procesa un archivo temporal ya ensamblado en disco:
+    - Si S3 / Cloudflare R2 está activo, lo sube por streaming al bucket S3.
+    - Si S3 no está activo o devuelve error, lo mueve al almacenamiento protegido local
+      (`protected_media/`) para que el vídeo o recurso quede operativo de inmediato.
     """
-    orig_name = sanitize_filename(file_storage.filename or "archivo")
-    mime_type = file_storage.mimetype or "application/octet-stream"
+    import shutil
+
+    orig_name = sanitize_filename(original_filename or "archivo")
+    effective_mime = mime_type or "application/octet-stream"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     object_key = f"{folder_prefix.strip('/')}/{timestamp}_{orig_name}"
-
-    file_bytes = file_storage.read()
-    size_bytes = len(file_bytes)
+    size_bytes = os.path.getsize(file_path)
 
     cfg = get_storage_config()
+    s3_error_note = ""
     if is_s3_ready(cfg):
-        ok, log_msg = upload_file_to_s3(
-            file_bytes=file_bytes,
+        ok, log_msg = upload_filepath_to_s3(
+            file_path=file_path,
             object_key=object_key,
-            content_type=mime_type,
+            content_type=effective_mime,
             cfg=cfg,
         )
         if ok:
+            try:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+            except Exception:
+                pass
             return (
                 True,
                 {
                     "storage_provider": "s3",
                     "object_key": object_key,
-                    "original_filename": file_storage.filename or orig_name,
-                    "mime_type": mime_type,
+                    "original_filename": original_filename or orig_name,
+                    "mime_type": effective_mime,
                     "file_size_bytes": size_bytes,
                 },
                 log_msg,
             )
-        return False, {}, log_msg
+        s3_error_note = f" (Aviso S3: {log_msg})"
 
-    # Fallback en almacenamiento local protegido (fuera de static público)
+    # Almacenamiento local protegido (o fallback automático si S3 falló temporalmente)
     base_dir = ensure_protected_storage_dir()
     full_path = os.path.join(base_dir, object_key.replace("/", os.sep))
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
-    with open(full_path, "wb") as f:
-        f.write(file_bytes)
+    shutil.move(file_path, full_path)
 
     return (
         True,
         {
             "storage_provider": "local",
             "object_key": object_key,
-            "original_filename": file_storage.filename or orig_name,
-            "mime_type": mime_type,
+            "original_filename": original_filename or orig_name,
+            "mime_type": effective_mime,
             "file_size_bytes": size_bytes,
         },
-        f"Guardado en almacenamiento protegido local ({object_key}). Cuando actives Cloudflare R2 se subirán a tu bucket S3.",
+        f"Guardado en almacenamiento protegido del servidor ({object_key}).{s3_error_note}",
+    )
+
+
+def store_uploaded_media(
+    file_storage,
+    folder_prefix: str = "courses",
+) -> tuple[bool, dict, str]:
+    """
+    Guarda un archivo subido desde el panel Admin volcando primero por streaming a disco
+    para no saturar la RAM en archivos grandes (vídeos/audios/PDFs).
+    """
+    import uuid
+
+    base_dir = ensure_protected_storage_dir()
+    chunks_dir = os.path.join(base_dir, ".chunks")
+    os.makedirs(chunks_dir, exist_ok=True)
+    tmp_path = os.path.join(chunks_dir, f"single_{uuid.uuid4().hex}.part")
+    file_storage.save(tmp_path)
+
+    return store_uploaded_filepath(
+        file_path=tmp_path,
+        original_filename=file_storage.filename or "archivo",
+        mime_type=file_storage.mimetype or "application/octet-stream",
+        folder_prefix=folder_prefix,
     )
