@@ -111,8 +111,30 @@ def admin_required(fn):
 
 
 def slugify(text: str) -> str:
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", (text or "curso").lower()).strip("-")
+    """
+    Dirección amigable: minúsculas, sin tildes ni eñes («Guía de autoestima» ->
+    «guia-de-autoestima», «niña» -> «nina», «col·legi» -> «col-legi»).
+    """
+    import unicodedata
+
+    normalized = unicodedata.normalize("NFKD", (text or "curso").lower())
+    ascii_text = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    slug = re.sub(r"[^a-z0-9]+", "-", ascii_text).strip("-")
     return slug or f"curso-{int(datetime.now(timezone.utc).timestamp())}"
+
+
+def _find_resource_by_previous_slug(slug: str) -> "PublicResource | None":
+    """Recurso publicado que tuvo antes esta dirección (para redirigir con 301)."""
+    if not slug:
+        return None
+    candidates = PublicResource.query.filter(
+        PublicResource.is_published == True,
+        PublicResource.previous_slugs_json.like(f'%"{slug}"%'),
+    ).all()
+    for res in candidates:
+        if slug in res.get_previous_slugs():
+            return res
+    return None
 
 
 # ==========================================================
@@ -2995,6 +3017,11 @@ def public_get_resource_detail(slug_or_id: str):
     res = PublicResource.query.filter_by(slug=slug_or_id).first()
     if not res and slug_or_id.isdigit():
         res = PublicResource.query.get(int(slug_or_id))
+    if not res:
+        # Dirección antigua de un recurso que cambió de slug: la web redirige (301)
+        moved = _find_resource_by_previous_slug(slug_or_id)
+        if moved:
+            return jsonify({"moved_to_slug": moved.slug}), 200
     if not res or not res.is_published:
         return jsonify({"error": "El recurso solicitado no existe o no está disponible."}), 404
 
@@ -3686,7 +3713,7 @@ def _apply_resource_payload(res: PublicResource, data: dict) -> None:
             PublicResource.slug == desired_slug, PublicResource.id != res.id
         ).first()
         if not existing:
-            res.slug = desired_slug
+            res.change_slug(desired_slug)
 
     if "subtitle" in data:
         res.subtitle = (data.get("subtitle") or "").strip()

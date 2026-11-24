@@ -131,6 +131,7 @@ def ensure_schema_columns_via_sqlalchemy() -> bool:
 
         migrations = {
             "public_resources": [
+                ("previous_slugs_json", "TEXT NULL"),
                 ("meta_title", "VARCHAR(255) DEFAULT ''"),
                 ("meta_description", "VARCHAR(350) DEFAULT ''"),
                 ("seo_keywords", "VARCHAR(400) DEFAULT ''"),
@@ -217,6 +218,41 @@ def _create_sample_pdf_bytes(title: str, subtitle: str) -> bytes:
         b"trailer << /Size 6 /Root 1 0 R >>\nstartxref\n0\n%%EOF"
     )
     return pdf
+
+
+def fix_legacy_resource_slugs() -> None:
+    """
+    Corrige las direcciones de recursos generadas con el slugify antiguo, que
+    convertía las letras con tilde en guiones («Guía» -> «gu-a»). Solo toca los
+    recursos cuyo slug coincide exactamente con lo que el algoritmo antiguo
+    generaba a partir del título; la dirección vieja queda redirigida (301).
+    Es idempotente: si ya está corregido, no hace nada.
+    """
+    import re as _re
+    from app.routes import slugify
+
+    def legacy_slugify(text: str) -> str:
+        return _re.sub(r"[^a-zA-Z0-9]+", "-", (text or "").lower()).strip("-")
+
+    try:
+        changed = 0
+        for res in PublicResource.query.all():
+            legacy = legacy_slugify(res.title)
+            fixed = slugify(res.title)
+            if res.slug != legacy or legacy == fixed:
+                continue
+            if PublicResource.query.filter(
+                PublicResource.slug == fixed, PublicResource.id != res.id
+            ).first():
+                continue
+            res.change_slug(fixed)
+            changed += 1
+        if changed:
+            db.session.commit()
+            print(f"[SLUGS] {changed} recurso(s) con tildes corregidos; las direcciones antiguas redirigen (301).")
+    except Exception as exc:
+        db.session.rollback()
+        print(f"[AVISO SLUGS] {exc}")
 
 
 def seed_initial_data() -> None:
@@ -722,6 +758,7 @@ def create_app() -> Flask:
             ensure_schema_columns_via_sqlalchemy()
             seed_initial_data()
             seed_marketing_defaults()
+            fix_legacy_resource_slugs()
         except Exception as exc:
             print(
                 f"[AVISO SQLAlchemy] Revisa que MySQL 8.0 esté en ejecución con la BD '{Config.DB_NAME}': {exc}"

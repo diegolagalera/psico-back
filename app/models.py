@@ -728,6 +728,31 @@ class PublicResource(db.Model):
     views_count = db.Column(db.Integer, nullable=False, default=0)
     unlocks_count = db.Column(db.Integer, nullable=False, default=0)
 
+    # Direcciones antiguas del recurso (JSON). Si alguien entra por una de ellas,
+    # la web redirige (301) a la actual para no perder lo indexado por Google.
+    previous_slugs_json = db.Column(db.Text, nullable=True, default="[]")
+
+    def get_previous_slugs(self) -> list:
+        import json
+
+        try:
+            data = json.loads(self.previous_slugs_json or "[]")
+            return [s for s in data if isinstance(s, str)] if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def change_slug(self, new_slug: str) -> None:
+        """Cambia la dirección guardando la anterior en el historial."""
+        import json
+
+        if not new_slug or new_slug == self.slug:
+            return
+        history = [s for s in self.get_previous_slugs() if s != new_slug]
+        if self.slug and self.slug not in history:
+            history.append(self.slug)
+        self.previous_slugs_json = json.dumps(history[-20:], ensure_ascii=False)
+        self.slug = new_slug
+
     created_at = db.Column(
         db.DateTime,
         nullable=False,
