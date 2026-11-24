@@ -20,3 +20,6 @@ protected_media/
 .vscode/
 .idea/
 *.log
+
+# Base de datos SQLite de desarrollo local
+local_dev.sqlite

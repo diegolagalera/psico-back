@@ -24,6 +24,8 @@ from app.marketing_service import (
     extract_title_from_html,
     generate_tracking_token,
     html_to_plain_text,
+    claim_automation_item_for_manual_send,
+    mark_automation_item_result,
     process_pending_marketing_jobs,
     render_marketing_html,
     resolve_api_base_url,
@@ -71,10 +73,20 @@ def _parse_iso_datetime(val: str | None) -> datetime | None:
         return None
 
 
+_async_worker_running = threading.Lock()
+
+
 def _trigger_async_worker(app_obj) -> None:
+    """Lanza una pasada del planificador en segundo plano (como mucho una a la vez por proceso)."""
+    if not _async_worker_running.acquire(blocking=False):
+        return
+
     def _run():
-        with app_obj.app_context():
-            process_pending_marketing_jobs()
+        try:
+            with app_obj.app_context():
+                process_pending_marketing_jobs()
+        finally:
+            _async_worker_running.release()
 
     threading.Thread(target=_run, daemon=True).start()
 
@@ -156,11 +168,27 @@ def track_email_click(token: str):
     """
     from flask import redirect
 
+    from urllib.parse import urlparse
+
+    from app.marketing_service import verify_click_url
+
     _record_open_by_token(token)
+    fallback = "https://carlaviladotpsicologia.com"
     target_url = (request.args.get("u") or "").strip()
     if not target_url.startswith(("http://", "https://")):
-        target_url = "https://carlaviladotpsicologia.com"
-    return redirect(target_url, code=302)
+        return redirect(fallback, code=302)
+
+    # Enlaces nuevos: llevan firma HMAC y pueden ir a cualquier dominio.
+    if verify_click_url(token, target_url, (request.args.get("s") or "").strip()):
+        return redirect(target_url, code=302)
+
+    # Enlaces de correos antiguos (sin firma): solo dominios propios, para que
+    # nadie pueda usar esta URL como redirección abierta hacia sitios de phishing.
+    host = (urlparse(target_url).hostname or "").lower()
+    trusted_hosts = ("carlaviladotpsicologia.com", "instagram.com")
+    if any(host == h or host.endswith("." + h) for h in trusted_hosts):
+        return redirect(target_url, code=302)
+    return redirect(fallback, code=302)
 
 
 @marketing_bp.route(
@@ -168,8 +196,11 @@ def track_email_click(token: str):
 )
 def unsubscribe_marketing(token: str):
     """
-    Procesa la baja de comunicaciones comerciales con un solo clic (cumpliendo
-    RFC 8058 List-Unsubscribe-Post de Gmail/Yahoo y enlace directo en el pie del email).
+    Baja de comunicaciones comerciales.
+    - GET (clic en el enlace del pie): muestra una página con un botón de
+      confirmar. No da de baja directamente, porque los antivirus y escáneres de
+      enlaces del correo abren las URLs y darían de baja a gente sin querer.
+    - POST (botón de la página o "un clic" de Gmail/Yahoo, RFC 8058): da de baja.
     """
     clean_token = (token or "").strip()
     email_found = ""
@@ -189,6 +220,24 @@ def unsubscribe_marketing(token: str):
             if q_item:
                 email_found = q_item.email
                 name_found = q_item.name or ""
+
+    if request.method == "GET":
+        if not email_found:
+            return _unsubscribe_page(
+                "Enlace no válido",
+                "Este enlace de baja no es válido o ha caducado. Si quieres dejar de recibir correos, responde a cualquiera de ellos y te daremos de baja.",
+            )
+        safe_token = html.escape(clean_token, quote=True)
+        return _unsubscribe_page(
+            "¿Quieres darte de baja?",
+            f"Dejarás de recibir en <strong>{html.escape(email_found)}</strong> los correos de recursos, novedades y secuencias automáticas de Carla Viladot Psicología.",
+            form_html=f"""
+    <form method="POST" action="/api/marketing/unsubscribe/{safe_token}" style="margin:0;">
+      <button type="submit" style="background:#4A6B5D;color:#FFFFFF;border:0;padding:12px 24px;border-radius:99px;font-size:14px;font-weight:bold;cursor:pointer;">
+        Sí, darme de baja
+      </button>
+    </form>""",
+        )
 
     if email_found:
         email_clean = email_found.strip().lower()
@@ -213,33 +262,58 @@ def unsubscribe_marketing(token: str):
             p.status = "skipped_unsubscribed"
             p.error_message = "El usuario solicitó darse de baja."
 
+        # Y los destinatarios pendientes de campañas en curso o programadas
+        pending_recs = MarketingCampaignRecipient.query.filter_by(
+            email=email_clean, status="pending"
+        ).all()
+        for r in pending_recs:
+            r.status = "skipped_unsubscribed"
+            r.error_message = "El usuario solicitó darse de baja."
+
         db.session.commit()
 
-    if request.method == "POST":
-        return jsonify({"status": "unsubscribed", "email": email_found}), 200
+    if not email_found:
+        return _unsubscribe_page(
+            "Enlace no válido",
+            "Este enlace de baja no es válido o ha caducado. Si quieres dejar de recibir correos, responde a cualquiera de ellos y te daremos de baja.",
+        )
+    return _unsubscribe_page(
+        "Has actualizado tus preferencias",
+        f"Hemos dado de baja a <strong>{html.escape(email_found)}</strong> de nuestra lista de envíos de email marketing y secuencias automáticas. No recibirás más correos promocionales.",
+        show_home_link=True,
+    )
 
-    safe_email = html.escape(email_found or "tu correo")
-    html_page = f"""<!DOCTYPE html>
+
+def _unsubscribe_page(
+    title: str, body_html: str, form_html: str = "", show_home_link: bool = False
+) -> Response:
+    home_link = (
+        """
+    <a href="https://carlaviladotpsicologia.com" style="display:inline-block;background:#4A6B5D;color:#FFFFFF;text-decoration:none;padding:12px 24px;border-radius:99px;font-size:14px;font-weight:bold;">
+      Volver a carlaviladotpsicologia.com
+    </a>"""
+        if show_home_link
+        else ""
+    )
+    page = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Suscripción actualizada · Carla Viladot Psicología</title>
+  <meta name="robots" content="noindex, nofollow" />
+  <title>{html.escape(title)} · Carla Viladot Psicología</title>
 </head>
 <body style="margin:0;padding:40px 16px;background-color:#FAF8F5;font-family:'Helvetica Neue',Arial,sans-serif;color:#2C3E35;text-align:center;">
   <div style="max-width:480px;margin:40px auto;background:#FFFFFF;border-radius:20px;padding:36px 28px;border:1px solid #E6E1DA;box-shadow:0 8px 28px rgba(0,0,0,0.04);">
-    <div style="width:48px;height:48px;border-radius:50%;background:#F0F3EF;color:#4A6B5D;display:inline-flex;align-items:center;justify-content:center;font-size:22px;margin-bottom:16px;">✓</div>
-    <h1 style="font-family:Georgia,serif;font-size:22px;margin:0 0 12px 0;color:#2C3E35;">Has actualizado tus preferencias</h1>
-    <p style="font-size:15px;line-height:1.6;color:#555852;margin:0 0 24px 0;">
-      Hemos dado de baja a <strong>{safe_email}</strong> de nuestra lista de envíos de email marketing y secuencias automáticas. No recibirás más correos promocionales.
-    </p>
-    <a href="https://carlaviladotpsicologia.com" style="display:inline-block;background:#4A6B5D;color:#FFFFFF;text-decoration:none;padding:12px 24px;border-radius:99px;font-size:14px;font-weight:bold;">
-      Volver a carlaviladotpsicologia.com
-    </a>
+    <h1 style="font-family:Georgia,serif;font-size:22px;margin:0 0 12px 0;color:#2C3E35;">{html.escape(title)}</h1>
+    <p style="font-size:15px;line-height:1.6;color:#555852;margin:0 0 24px 0;">{body_html}</p>
+    {form_html}{home_link}
   </div>
 </body>
 </html>"""
-    return Response(html_page, mimetype="text/html")
+    resp = Response(page, mimetype="text/html")
+    resp.headers["X-Robots-Tag"] = "noindex, nofollow"
+    return resp
 
 
 # ==============================================================================
@@ -259,8 +333,9 @@ def admin_marketing_overview():
     - Secuencia automática 24h / 48h / 72h y su cola de envíos
     """
     seed_marketing_defaults()
-    # Aprovechar para procesar cualquier envío vencido
-    process_pending_marketing_jobs()
+    # Aprovechar para procesar envíos vencidos, en segundo plano para que el
+    # panel cargue al momento (antes se enviaban dentro de la petición GET).
+    _trigger_async_worker(current_app._get_current_object())
 
     templates = (
         MarketingTemplate.query.order_by(MarketingTemplate.updated_at.desc()).all()
@@ -854,7 +929,7 @@ def admin_delete_group(group_id: int):
 @marketing_bp.route("/admin/marketing/campaigns", methods=["GET"])
 @admin_required
 def admin_list_campaigns():
-    process_pending_marketing_jobs()
+    _trigger_async_worker(current_app._get_current_object())
     campaigns = (
         MarketingCampaign.query.order_by(MarketingCampaign.created_at.desc()).all()
     )
@@ -874,7 +949,7 @@ def admin_list_campaigns():
 @marketing_bp.route("/admin/marketing/campaigns/<int:campaign_id>", methods=["GET"])
 @admin_required
 def admin_get_campaign_detail(campaign_id: int):
-    process_pending_marketing_jobs()
+    _trigger_async_worker(current_app._get_current_object())
     camp = MarketingCampaign.query.get(campaign_id)
     if not camp:
         return jsonify({"error": "Campaña no encontrada."}), 404
@@ -1100,7 +1175,7 @@ def admin_delete_campaign(campaign_id: int):
 @admin_required
 def admin_get_automation():
     seed_marketing_defaults()
-    process_pending_marketing_jobs()
+    _trigger_async_worker(current_app._get_current_object())
 
     steps = (
         MarketingAutomationStep.query.order_by(
@@ -1279,6 +1354,24 @@ def admin_send_automation_queue_item_now(queue_id: int):
     if not step:
         return jsonify({"error": "Paso de automatización no encontrado."}), 404
 
+    lead = MarketingLead.query.filter_by(email=item.email).first()
+    if lead and not lead.consent_marketing:
+        return (
+            jsonify({"error": "Esta persona se dio de baja de las comunicaciones de marketing."}),
+            400,
+        )
+
+    if item.status == "sent":
+        return jsonify({"error": "Este correo ya se envió.", "item": item.to_dict()}), 409
+
+    # Reclamar el envío de forma atómica para que el planificador no lo mande a la vez
+    if not claim_automation_item_for_manual_send(item.id):
+        db.session.refresh(item)
+        return (
+            jsonify({"error": "Este correo se está enviando ahora mismo.", "item": item.to_dict()}),
+            409,
+        )
+
     ok, log_msg = send_marketing_email(
         to_email=item.email,
         subject=step.subject,
@@ -1289,13 +1382,10 @@ def admin_send_automation_queue_item_now(queue_id: int):
         preheader=step.preheader or "",
         is_test=False,
     )
+    mark_automation_item_result(item.id, step.id, ok, log_msg)
+    db.session.refresh(item)
 
     if ok:
-        item.status = "sent"
-        item.sent_at = datetime.now(timezone.utc)
-        item.error_message = None
-        step.total_sent = int(step.total_sent or 0) + 1
-        db.session.commit()
         return (
             jsonify(
                 {
@@ -1305,11 +1395,7 @@ def admin_send_automation_queue_item_now(queue_id: int):
             ),
             200,
         )
-    else:
-        item.status = "failed"
-        item.error_message = log_msg
-        db.session.commit()
-        return jsonify({"error": log_msg, "item": item.to_dict()}), 400
+    return jsonify({"error": log_msg, "item": item.to_dict()}), 400
 
 
 @marketing_bp.route(

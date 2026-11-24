@@ -1,3 +1,4 @@
+from sqlalchemy.exc import IntegrityError
 from datetime import datetime, time as dt_time, timedelta, timezone
 from app.models import (
     Course,
@@ -88,8 +89,9 @@ def calculate_lesson_unlock_datetimes(
 
 def ensure_student_enrolled(user_id: int, course_id: int | None = None) -> Enrollment | None:
     """
-    Garantiza que el alumno tenga matrícula activa en el curso indicado (o en el
-    primer curso activo si no se especifica).
+    Crea la matrícula del alumno en el curso indicado (o en el primer curso
+    activo si no se especifica). Solo debe llamarse desde acciones explícitas del
+    administrador: el campus nunca matricula por su cuenta.
     """
     if course_id:
         course = Course.query.get(course_id)
@@ -105,23 +107,32 @@ def ensure_student_enrolled(user_id: int, course_id: int | None = None) -> Enrol
         user_id=user_id, course_id=course.id
     ).first()
     if not enrollment:
-        user = User.query.get(user_id)
-        enrolled_time = (
-            ensure_utc(user.created_at)
-            if (user and user.created_at)
-            else datetime.now(timezone.utc)
-        )
         enrollment = Enrollment(
             user_id=user_id,
             course_id=course.id,
-            enrolled_at=enrolled_time,
+            enrolled_at=datetime.now(timezone.utc),
             status="active",
             unlock_all_override=False,
         )
         db.session.add(enrollment)
-        db.session.commit()
+        try:
+            db.session.commit()
+        except IntegrityError:
+            # Otra petición la creó a la vez (restricción única user+curso)
+            db.session.rollback()
+            enrollment = Enrollment.query.filter_by(
+                user_id=user_id, course_id=course.id
+            ).first()
 
     return enrollment
+
+
+def get_active_enrollment(user_id: int, course_id: int) -> Enrollment | None:
+    """Matrícula activa del alumno en el curso, sin crearla nunca."""
+    enrollment = Enrollment.query.filter_by(user_id=user_id, course_id=course_id).first()
+    if enrollment and (enrollment.status or "active") == "active":
+        return enrollment
+    return None
 
 
 def build_student_course_roadmap(
@@ -142,7 +153,10 @@ def build_student_course_roadmap(
     else:
         now_dt = ensure_utc(now_dt)
 
-    enrollment = ensure_student_enrolled(user_id, course.id)
+    enrollment = Enrollment.query.filter_by(
+        user_id=user_id, course_id=course.id
+    ).first()
+    is_enrolled = bool(enrollment and (enrollment.status or "active") == "active")
     enrolled_at = (
         ensure_utc(enrollment.enrolled_at)
         if enrollment
@@ -209,7 +223,11 @@ def build_student_course_roadmap(
 
         # Determinar si está desbloqueada y por qué motivo
         auto_unlocked = now_dt >= sched_dt
-        if unlock_all_override:
+        if not is_enrolled:
+            # Sin matrícula activa no se abre ninguna clase (el admin decide el acceso)
+            is_unlocked = False
+            unlock_source = "not_enrolled"
+        elif unlock_all_override:
             is_unlocked = True
             unlock_source = "course_override"
         elif ov and ov.force_state == "unlocked":
@@ -395,6 +413,7 @@ def build_student_course_roadmap(
             "drip_summary": drip_summary,
         },
         "enrollment": enrollment.to_dict() if enrollment else None,
+        "is_enrolled": is_enrolled,
         "summary": {
             "total_modules": len(modules_payload),
             "total_lessons": total_lessons,

@@ -648,6 +648,41 @@ def compute_available_slots(
     }
 
 
+MAX_BOOKING_WEEK_OFFSET = 4  # el campus permite navegar hasta 4 semanas vista
+
+
+def validate_requested_slot(cfg: dict, start_utc: datetime) -> tuple[bool, str]:
+    """
+    Comprueba en el servidor que el inicio pedido coincide con un hueco
+    "available" de compute_available_slots: dentro del horario laboral, con la
+    antelación mínima, sin choques con Google Calendar ni con otras reservas y
+    dentro de las semanas que ofrece el campus.
+    """
+    start_utc = ensure_utc(start_utc)
+    tz = get_tz(cfg)
+    now_utc = datetime.now(timezone.utc)
+    current_monday = get_week_dates(cfg, now_utc, week_offset=0)[0]
+    start_local_date = start_utc.astimezone(tz).date()
+    week_offset = (start_local_date - current_monday).days // 7
+    if week_offset < 0 or week_offset > MAX_BOOKING_WEEK_OFFSET:
+        return False, "Ese horario está fuera de las semanas disponibles para reservar."
+
+    slots_data = compute_available_slots(cfg, now_utc=now_utc, week_offset=week_offset)
+    for day in slots_data.get("days", []):
+        for slot in day.get("slots", []):
+            try:
+                slot_start = datetime.fromisoformat(slot["start_at"])
+            except Exception:
+                continue
+            if abs((ensure_utc(slot_start) - start_utc).total_seconds()) < 1:
+                if slot.get("available"):
+                    return True, ""
+                if slot.get("status") == "occupied":
+                    return False, "Ese horario acaba de ser ocupado. Por favor, selecciona otro hueco."
+                return False, "Ese horario ya no cumple la antelación mínima para reservar."
+    return False, "Ese horario no está dentro de los huecos disponibles de la agenda."
+
+
 # ==========================================================
 # EVENTOS (CREAR / CANCELAR)
 # ==========================================================

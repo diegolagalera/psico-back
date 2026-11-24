@@ -262,6 +262,8 @@ class MarketingCampaignRecipient(db.Model):
     )
     # 'pending' | 'processing' | 'sent' | 'failed' | 'skipped_unsubscribed'
     status = db.Column(db.String(30), nullable=False, default="pending", index=True)
+    # Momento en que un proceso reclamó el envío (status="processing")
+    processing_started_at = db.Column(db.DateTime, nullable=True)
     sent_at = db.Column(db.DateTime, nullable=True)
     opened_at = db.Column(db.DateTime, nullable=True)
     last_opened_at = db.Column(db.DateTime, nullable=True)
@@ -383,6 +385,8 @@ class MarketingAutomationQueue(db.Model):
     scheduled_for = db.Column(db.DateTime, nullable=False, index=True)  # UTC
     # 'pending' | 'processing' | 'sent' | 'failed' | 'cancelled' | 'skipped_unsubscribed'
     status = db.Column(db.String(30), nullable=False, default="pending", index=True)
+    # Momento en que un proceso reclamó el envío (status="processing")
+    processing_started_at = db.Column(db.DateTime, nullable=True)
     tracking_token = db.Column(
         db.String(64), unique=True, nullable=False, index=True
     )

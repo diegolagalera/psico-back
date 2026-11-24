@@ -1,4 +1,6 @@
 import base64
+import hashlib
+import hmac
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -17,6 +19,7 @@ from typing import Tuple
 from flask import Flask, has_request_context, request
 from sqlalchemy import text
 
+from app.config import Config
 from app.email_service import get_or_create_system_config
 from app.models import MarketingLead, User, db
 from app.marketing_models import (
@@ -37,6 +40,20 @@ TRACKING_GIF_BYTES = base64.b64decode(
 _scheduler_started = False
 _scheduler_lock = threading.Lock()
 
+
+
+def sign_click_url(tracking_token: str, url: str) -> str:
+    """Firma (token, url) para que /track/click solo redirija a enlaces que pusimos nosotros."""
+    msg = f"{tracking_token}|{url}".encode("utf-8")
+    return hmac.new(
+        Config.JWT_SECRET_KEY.encode("utf-8"), msg, hashlib.sha256
+    ).hexdigest()[:32]
+
+
+def verify_click_url(tracking_token: str, url: str, signature: str) -> bool:
+    if not signature:
+        return False
+    return hmac.compare_digest(sign_click_url(tracking_token, url), signature)
 
 def generate_tracking_token() -> str:
     return secrets.token_urlsafe(24)
@@ -209,8 +226,7 @@ def prepare_tracked_email_html(
     """
     Inyecta en el HTML:
     1. Preheader sutil (si se indica).
-    2. Enlace discreto de baja (solo si include_unsubscribe_footer=True, ya que
-       incluir cabeceras/pies de baja masiva hace que Gmail clasifique el correo en 'Promociones').
+    2. Enlace discreto de baja (si include_unsubscribe_footer=True).
     3. Píxel transparente 1x1 de seguimiento de apertura (sin opacity:0 para que
        el proxy de imágenes de Gmail lo cargue siempre).
     Devuelve (final_html, unsubscribe_url).
@@ -290,7 +306,8 @@ def prepare_tracked_email_html(
             ):
                 return match.group(0)
             encoded = urllib.parse.quote(original_url, safe="")
-            tracked_href = f"{base}/api/marketing/track/click/{tracking_token}?u={encoded}"
+            sig = sign_click_url(tracking_token, original_url)
+            tracked_href = f"{base}/api/marketing/track/click/{tracking_token}?u={encoded}&s={sig}"
             return f"{prefix}{tracked_href}{suffix}"
 
         final_html = re.sub(
@@ -312,13 +329,14 @@ def send_marketing_email(
     api_base_url: str | None = None,
     preheader: str = "",
     is_test: bool = False,
-    include_unsubscribe: bool = False,
+    include_unsubscribe: bool = True,
 ) -> Tuple[bool, str]:
     """
     Envía un correo con versión text/plain + text/html (MIMEMultipart('alternative'))
     y píxel de seguimiento de apertura.
-    Nota: `include_unsubscribe=False` por defecto para evitar que Gmail clasifique
-    automáticamente el correo en la pestaña 'Promociones' por llevar cabeceras de envío masivo.
+    Todo envío real lleva enlace de baja en el pie y cabeceras List-Unsubscribe
+    (obligatorio por el art. 21 de la LSSI y exigido por Gmail/Yahoo a los
+    remitentes masivos). Solo los envíos de prueba (`is_test`) lo omiten.
     """
     config_obj = get_or_create_system_config()
     cfg = config_obj.to_dict()
@@ -672,38 +690,86 @@ def resolve_campaign_Audience(
     return [{"email": k, "name": v} for k, v in recipients_map.items()]
 
 
+STUCK_PROCESSING_MINUTES = 15
+
+
+def _claim_row(model, row_id: int, from_statuses: tuple[str, ...] = ("pending",)) -> bool:
+    """
+    Reclama un envío de forma atómica: UPDATE ... WHERE status='pending'.
+    Solo un proceso (worker de gunicorn, hilo del planificador o petición del
+    admin) consigue cambiar la fila, así que nunca se envía el mismo correo dos
+    veces aunque varios procesen la cola a la vez.
+    """
+    now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
+    updated = (
+        db.session.query(model)
+        .filter(model.id == row_id, model.status.in_(from_statuses))
+        .update(
+            {"status": "processing", "processing_started_at": now_naive},
+            synchronize_session=False,
+        )
+    )
+    db.session.commit()
+    return updated == 1
+
+
+def claim_automation_item_for_manual_send(item_id: int) -> bool:
+    """Para el botón "enviar ahora" del admin: admite pendientes y fallidos."""
+    return _claim_row(MarketingAutomationQueue, item_id, ("pending", "failed", "cancelled"))
+
+
+def _release_stuck_processing(now_naive: datetime) -> None:
+    """
+    Si un proceso murió a mitad de envío (p. ej. un redespliegue), la fila se
+    quedaría en "processing" para siempre. Pasado un margen se marca como
+    fallida para que el admin la vea y la reenvíe si hace falta; no se reintenta
+    sola porque el correo pudo llegar a salir.
+    """
+    limit = now_naive - timedelta(minutes=STUCK_PROCESSING_MINUTES)
+    msg = "Envío interrumpido (el servidor se reinició durante el envío). Revisa si llegó y reenvíalo si hace falta."
+    for model in (MarketingAutomationQueue, MarketingCampaignRecipient):
+        db.session.query(model).filter(
+            model.status == "processing",
+            db.or_(
+                model.processing_started_at.is_(None),
+                model.processing_started_at < limit,
+            ),
+        ).update(
+            {"status": "failed", "error_message": msg},
+            synchronize_session=False,
+        )
+    db.session.commit()
+
+
 def process_pending_marketing_jobs() -> dict:
     """
-    Procesa de forma segura (con bloqueo en BD para evitar duplicados en múltiples workers):
+    Procesa:
     1. Correos pendientes en `marketing_automation_queue` cuya hora `scheduled_for` ya llegó.
     2. Campañas en `marketing_campaigns` con estado `scheduled` o `sending` cuya hora `scheduled_at` ya llegó.
+    Es seguro ejecutarlo en paralelo desde varios workers: cada envío se reclama
+    de forma atómica antes de mandarlo (ver `_claim_row`).
     """
     summary = {"automation_sent": 0, "automation_failed": 0, "campaigns_sent": 0, "campaigns_failed": 0}
-
-    # Intentar adquirir lock de MySQL no bloqueante para evitar colisión entre workers de Gunicorn
-    lock_acquired = False
-    try:
-        res = db.session.execute(
-            text("SELECT GET_LOCK('vuelveati_marketing_worker_lock', 0)")
-        ).scalar()
-        if res != 1:
-            return summary
-        lock_acquired = True
-    except Exception:
-        # Si no es MySQL o falla GET_LOCK, continuamos apoyándonos en estados transaccionales
-        pass
 
     try:
         now_utc = datetime.now(timezone.utc)
         now_naive = now_utc.replace(tzinfo=None)
+        _release_stuck_processing(now_naive)
 
         # ------------------------------------------------------------------
         # 1. PROCESAR COLA DE AUTOMATIZACIÓN (24h / 48h / 72h)
         # ------------------------------------------------------------------
+        # Solo pasos activos: los pendientes de un paso desactivado esperan sin
+        # bloquear al resto de la cola.
         due_queue = (
-            MarketingAutomationQueue.query.filter(
+            MarketingAutomationQueue.query.join(
+                MarketingAutomationStep,
+                MarketingAutomationStep.id == MarketingAutomationQueue.step_id,
+            )
+            .filter(
                 MarketingAutomationQueue.status == "pending",
                 MarketingAutomationQueue.scheduled_for <= now_naive,
+                MarketingAutomationStep.is_active.is_(True),
             )
             .order_by(MarketingAutomationQueue.scheduled_for.asc())
             .limit(25)
@@ -711,20 +777,28 @@ def process_pending_marketing_jobs() -> dict:
         )
 
         for item in due_queue:
+            item_id = item.id
             step = MarketingAutomationStep.query.get(item.step_id)
             if not step or not step.is_active:
                 continue
 
-            # Verificar si el lead sigue con consent_marketing = True
             lead = MarketingLead.query.filter_by(email=item.email).first()
             if lead and not lead.consent_marketing:
-                item.status = "skipped_unsubscribed"
-                item.error_message = "El usuario se dio de baja de comunicaciones de marketing."
+                db.session.query(MarketingAutomationQueue).filter(
+                    MarketingAutomationQueue.id == item_id,
+                    MarketingAutomationQueue.status == "pending",
+                ).update(
+                    {
+                        "status": "skipped_unsubscribed",
+                        "error_message": "El usuario se dio de baja de comunicaciones de marketing.",
+                    },
+                    synchronize_session=False,
+                )
                 db.session.commit()
                 continue
 
-            item.status = "processing"
-            db.session.commit()
+            if not _claim_row(MarketingAutomationQueue, item_id):
+                continue  # otro proceso ya lo está enviando
 
             recipient_name = item.name or (lead.name if lead else "") or ""
             ok, log_msg = send_marketing_email(
@@ -737,19 +811,11 @@ def process_pending_marketing_jobs() -> dict:
                 preheader=step.preheader or "",
                 is_test=False,
             )
-
+            mark_automation_item_result(item_id, step.id, ok, log_msg)
             if ok:
-                item.status = "sent"
-                item.sent_at = datetime.now(timezone.utc)
-                item.error_message = None
-                step.total_sent = int(step.total_sent or 0) + 1
                 summary["automation_sent"] += 1
             else:
-                item.status = "failed"
-                item.error_message = log_msg
                 summary["automation_failed"] += 1
-
-            db.session.commit()
             time.sleep(0.6)  # Pausa anti-spam entre envíos
 
         # ------------------------------------------------------------------
@@ -768,36 +834,42 @@ def process_pending_marketing_jobs() -> dict:
         )
 
         for camp in due_campaigns:
+            camp_id = camp.id
             if camp.status == "scheduled":
-                camp.status = "sending"
-                camp.started_at = datetime.now(timezone.utc)
+                db.session.query(MarketingCampaign).filter(
+                    MarketingCampaign.id == camp_id,
+                    MarketingCampaign.status == "scheduled",
+                ).update(
+                    {"status": "sending", "started_at": now_naive},
+                    synchronize_session=False,
+                )
                 db.session.commit()
 
             pending_recs = (
                 MarketingCampaignRecipient.query.filter_by(
-                    campaign_id=camp.id, status="pending"
+                    campaign_id=camp_id, status="pending"
                 )
                 .order_by(MarketingCampaignRecipient.id.asc())
                 .limit(35)
                 .all()
             )
 
-            if not pending_recs:
-                camp.status = "sent"
-                camp.completed_at = datetime.now(timezone.utc)
-                db.session.commit()
-                continue
-
             for rec in pending_recs:
+                rec_id = rec.id
                 lead = MarketingLead.query.filter_by(email=rec.email).first()
                 if lead and not lead.consent_marketing:
-                    rec.status = "skipped_unsubscribed"
-                    rec.error_message = "Usuario dado de baja."
+                    db.session.query(MarketingCampaignRecipient).filter(
+                        MarketingCampaignRecipient.id == rec_id,
+                        MarketingCampaignRecipient.status == "pending",
+                    ).update(
+                        {"status": "skipped_unsubscribed", "error_message": "Usuario dado de baja."},
+                        synchronize_session=False,
+                    )
                     db.session.commit()
                     continue
 
-                rec.status = "processing"
-                db.session.commit()
+                if not _claim_row(MarketingCampaignRecipient, rec_id):
+                    continue
 
                 ok, log_msg = send_marketing_email(
                     to_email=rec.email,
@@ -809,48 +881,76 @@ def process_pending_marketing_jobs() -> dict:
                     preheader=camp.preheader or "",
                     is_test=False,
                 )
-
+                finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                db.session.query(MarketingCampaignRecipient).filter(
+                    MarketingCampaignRecipient.id == rec_id
+                ).update(
+                    {
+                        "status": "sent" if ok else "failed",
+                        "sent_at": finished_at if ok else None,
+                        "error_message": None if ok else log_msg,
+                    },
+                    synchronize_session=False,
+                )
+                # Contadores con UPDATE atómico (col = col + 1) para no perder
+                # sumas cuando dos procesos envían de la misma campaña.
+                counter = MarketingCampaign.sent_count if ok else MarketingCampaign.failed_count
+                db.session.query(MarketingCampaign).filter(
+                    MarketingCampaign.id == camp_id
+                ).update(
+                    {counter: counter + 1}, synchronize_session=False
+                )
+                db.session.commit()
                 if ok:
-                    rec.status = "sent"
-                    rec.sent_at = datetime.now(timezone.utc)
-                    rec.error_message = None
-                    camp.sent_count = int(camp.sent_count or 0) + 1
                     summary["campaigns_sent"] += 1
                 else:
-                    rec.status = "failed"
-                    rec.error_message = log_msg
-                    camp.failed_count = int(camp.failed_count or 0) + 1
                     summary["campaigns_failed"] += 1
-
-                db.session.commit()
                 time.sleep(0.6)  # Pausa anti-spam entre envíos
 
-            # Comprobar si ya no quedan pendientes en la campaña
-            still_pending = MarketingCampaignRecipient.query.filter_by(
-                campaign_id=camp.id, status="pending"
+            # Cerrar la campaña cuando ya no queda nada pendiente ni en curso
+            still_open = MarketingCampaignRecipient.query.filter(
+                MarketingCampaignRecipient.campaign_id == camp_id,
+                MarketingCampaignRecipient.status.in_(["pending", "processing"]),
             ).count()
-            if still_pending == 0:
-                if int(camp.sent_count or 0) == 0 and int(camp.failed_count or 0) > 0:
-                    camp.status = "failed"
-                else:
-                    camp.status = "sent"
-                camp.completed_at = datetime.now(timezone.utc)
-                db.session.commit()
+            if still_open == 0:
+                fresh = MarketingCampaign.query.get(camp_id)
+                if fresh and fresh.status == "sending":
+                    db.session.refresh(fresh)
+                    if int(fresh.sent_count or 0) == 0 and int(fresh.failed_count or 0) > 0:
+                        fresh.status = "failed"
+                    else:
+                        fresh.status = "sent"
+                    fresh.completed_at = datetime.now(timezone.utc)
+                    db.session.commit()
 
     except Exception as exc:
         print(f"[MARKETING WORKER ERROR] {exc}")
         traceback.print_exc()
         db.session.rollback()
-    finally:
-        if lock_acquired:
-            try:
-                db.session.execute(
-                    text("SELECT RELEASE_LOCK('vuelveati_marketing_worker_lock')")
-                )
-            except Exception:
-                pass
 
     return summary
+
+
+def mark_automation_item_result(item_id: int, step_id: int, ok: bool, log_msg: str) -> None:
+    finished_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    db.session.query(MarketingAutomationQueue).filter(
+        MarketingAutomationQueue.id == item_id
+    ).update(
+        {
+            "status": "sent" if ok else "failed",
+            "sent_at": finished_at if ok else None,
+            "error_message": None if ok else log_msg,
+        },
+        synchronize_session=False,
+    )
+    if ok:
+        db.session.query(MarketingAutomationStep).filter(
+            MarketingAutomationStep.id == step_id
+        ).update(
+            {MarketingAutomationStep.total_sent: MarketingAutomationStep.total_sent + 1},
+            synchronize_session=False,
+        )
+    db.session.commit()
 
 
 def start_marketing_scheduler(app: Flask) -> None:

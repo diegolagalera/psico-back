@@ -114,6 +114,40 @@ class SystemConfig(db.Model):
             ),
         }
 
+    def to_public_dict(self) -> dict:
+        """Igual que to_dict() pero sin exponer secretos: solo indica si están guardados."""
+        return mask_secret_fields(self.to_dict())
+
+
+# Campos de system_config que nunca deben viajar al navegador.
+SECRET_CONFIG_FIELDS = (
+    "smtp_password",
+    "gmail_token_json",
+    "s3_secret_access_key",
+    "calendar_token_json",
+)
+# Valor que el panel recibe en lugar del secreto. Si vuelve tal cual en un PUT
+# o en una prueba de conexión, se interpreta como "mantener el valor guardado".
+SECRET_MASK = "__SECRETO_GUARDADO__"
+
+
+def mask_secret_fields(cfg: dict) -> dict:
+    masked = dict(cfg)
+    for field in SECRET_CONFIG_FIELDS:
+        if field in masked:
+            masked[f"{field}_set"] = bool(masked.get(field))
+            masked[field] = SECRET_MASK if masked.get(field) else ""
+    return masked
+
+
+def restore_masked_secrets(data: dict, config: "SystemConfig") -> dict:
+    """Sustituye la máscara (o un campo ausente) por el secreto guardado en BD."""
+    restored = dict(data or {})
+    for field in SECRET_CONFIG_FIELDS:
+        if field not in restored or restored.get(field) == SECRET_MASK:
+            restored[field] = getattr(config, field) or ""
+    return restored
+
 
 class ContactMessage(db.Model):
     __tablename__ = "contact_messages"
@@ -463,6 +497,9 @@ class StudentLessonProgress(db.Model):
     is_completed = db.Column(db.Boolean, nullable=False, default=False)
     completed_at = db.Column(db.DateTime, nullable=True)
     last_accessed_at = db.Column(db.DateTime, nullable=True)
+    # Último informe de reproducción aceptado: sirve para limitar cuánto puede
+    # avanzar el progreso según el tiempo real transcurrido.
+    progress_reported_at = db.Column(db.DateTime, nullable=True)
 
     __table_args__ = (
         db.UniqueConstraint(

@@ -238,13 +238,22 @@ def build_welcome_email_html(name: str, email: str, temp_password: str) -> str:
 
 
 def build_contact_notification_html(
-    name: str, email: str, phone: str, message: str
+    name: str, email: str, phone: str, message: str, badge: str = "Nueva Solicitud de Sesión / Contacto"
 ) -> str:
+    import html as _html
+
+    # Los datos vienen de un formulario público: se escapan para que nadie pueda
+    # inyectar HTML (enlaces falsos, imágenes de rastreo…) en el correo de Carla.
+    name = _html.escape(name or "")
+    email = _html.escape(email or "", quote=True)
+    phone = _html.escape(phone or "")
+    message = _html.escape(message or "")
+    badge = _html.escape(badge or "")
     return f"""
     <div style="font-family: 'Helvetica Neue', Arial, sans-serif; background-color: #FAF8F5; padding: 32px; color: #2C3E35;">
       <div style="max-width: 580px; margin: 0 auto; background: #FFFFFF; border-radius: 16px; padding: 32px; border: 1px solid #E6E1DA;">
         <span style="background: #D9826C; color: #FFFFFF; padding: 4px 10px; border-radius: 99px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px;">
-          Nueva Solicitud de Sesión / Contacto
+          {badge}
         </span>
         <h2 style="margin: 16px 0 12px 0; color: #2C3E35;">Has recibido un mensaje desde la web "Vuelve a Ti"</h2>
         <p style="font-size: 14px; margin: 6px 0;"><strong>Nombre:</strong> {name}</p>

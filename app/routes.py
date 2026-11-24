@@ -7,9 +7,12 @@ import json
 import mimetypes
 import os
 import re
+import secrets
 import urllib.parse
 import urllib.request
+from sqlalchemy.exc import IntegrityError
 from flask import Blueprint, Response, jsonify, redirect, request, send_file
+from itsdangerous import BadSignature, SignatureExpired, URLSafeTimedSerializer
 from flask_jwt_extended import (
     create_access_token,
     get_jwt,
@@ -17,9 +20,12 @@ from flask_jwt_extended import (
     jwt_required,
 )
 
+from app.config import Config
+from app.rate_limit import is_rate_limited, rate_limit
 from app.course_service import (
     build_student_course_roadmap,
     ensure_student_enrolled,
+    get_active_enrollment,
 )
 from app.email_service import (
     build_contact_notification_html,
@@ -41,8 +47,11 @@ from app.models import (
     SessionBooking,
     StudentLessonOverride,
     StudentLessonProgress,
+    SECRET_MASK,
     User,
     db,
+    mask_secret_fields,
+    restore_masked_secrets,
 )
 from app.calendar_service import (
     build_calendar_service,
@@ -58,9 +67,13 @@ from app.calendar_service import (
     is_calendar_ready,
     parse_working_hours,
     test_calendar_connection,
+    validate_requested_slot,
 )
 from app.storage_service import (
     _get_ssl_context,
+    delete_stored_object,
+    local_storage_warning,
+    sanitize_folder_prefix,
     ensure_protected_storage_dir,
     generate_s3_presigned_url,
     get_storage_config,
@@ -106,6 +119,12 @@ def slugify(text: str) -> str:
 # 1. AUTENTICACIÓN (/api/auth/*)
 # ==========================================================
 @api_bp.route("/auth/login", methods=["POST"])
+@rate_limit(
+    "login-ip",
+    limit=15,
+    window_seconds=15 * 60,
+    message="Demasiados intentos de inicio de sesión. Espera 15 minutos y vuelve a probar.",
+)
 def login():
     data = request.get_json() or {}
     email = (data.get("email") or "").strip().lower()
@@ -113,6 +132,17 @@ def login():
 
     if not email or not password:
         return jsonify({"error": "Por favor, introduce tu email y contraseña."}), 400
+
+    # Límite adicional por cuenta, para frenar ataques repartidos entre muchas IPs.
+    if is_rate_limited(f"login-email:{email}", limit=10, window_seconds=15 * 60):
+        return (
+            jsonify(
+                {
+                    "error": "Demasiados intentos para esta cuenta. Espera 15 minutos y vuelve a probar."
+                }
+            ),
+            429,
+        )
 
     user = User.query.filter_by(email=email).first()
     if not user or not user.check_password(password):
@@ -167,6 +197,12 @@ def get_current_user():
 # 2. CONTACTO PÚBLICO LANDING PAGE (/api/contact)
 # ==========================================================
 @api_bp.route("/contact", methods=["POST"])
+@rate_limit(
+    "contact",
+    limit=5,
+    window_seconds=3600,
+    message="Has enviado varios mensajes seguidos. Espera un rato o escríbenos directamente por email.",
+)
 def submit_contact():
     data = request.get_json() or {}
     name = (data.get("name") or "").strip()
@@ -205,14 +241,163 @@ def submit_contact():
         subject=f"Nueva consulta en Vuelve a Ti de {name}",
         html_body=html_body,
     )
+    if not email_sent:
+        # El registro técnico solo va a los logs del servidor, nunca al visitante.
+        print(f"[CONTACTO] Fallo al notificar el mensaje #{contact_msg.id}: {email_log}")
 
     return (
         jsonify(
             {
                 "message": "Hemos recibido tu mensaje con total confidencialidad. Te responderemos en menos de 24 horas.",
-                "contact": contact_msg.to_dict(),
                 "email_dispatched": email_sent,
-                "email_log": email_log,
+            }
+        ),
+        201,
+    )
+
+
+_THERAPY_TYPES = {"individual": "Terapia individual (60 €)", "pareja": "Terapia de pareja (70 €)"}
+_THERAPY_SCHEDULES = {"9-13": "9 a 13 h", "13-15": "13 a 15 h", "15-20": "15 a 20 h"}
+_THERAPY_LANGUAGES = ("Castellano", "Català", "Me da igual")
+_THERAPY_SOURCES = (
+    "Instagram",
+    "Google",
+    "Me lo recomendó alguien",
+    "Me derivó otra profesional",
+    "Otro",
+)
+
+
+@api_bp.route("/therapy-request", methods=["POST"])
+@rate_limit(
+    "therapy-request",
+    limit=5,
+    window_seconds=3600,
+    message="Has enviado varias solicitudes seguidas. Espera un rato o escríbeme directamente por email.",
+)
+def submit_therapy_request():
+    """
+    Formulario «Reservar sesión» de la página /terapia-online.
+    Guarda la solicitud como mensaje de contacto (aparece en el panel) y avisa a Carla.
+    """
+    data = request.get_json() or {}
+
+    def _txt(key: str, max_len: int) -> str:
+        return str(data.get(key) or "").strip()[:max_len]
+
+    name = _txt("name", 120)
+    email = _txt("email", 150).lower()
+    phone = _txt("phone", 50)
+    therapy_type = _txt("therapy_type", 20)
+    reason = _txt("reason", 500)
+    schedules = [s for s in (data.get("schedules") or []) if s in _THERAPY_SCHEDULES]
+    schedule_other = _txt("schedule_other", 120)
+    language = _txt("language", 30)
+    source = _txt("source", 60)
+    questions = _txt("questions", 500)
+    online_confirmed = bool(data.get("online_confirmed"))
+    privacy_accepted = bool(data.get("privacy_accepted"))
+    wants_news = bool(data.get("wants_news"))
+
+    errors = []
+    if not name:
+        errors.append("tu nombre")
+    if not email or not re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email):
+        errors.append("un email válido")
+    if not phone:
+        errors.append("tu teléfono")
+    if therapy_type not in _THERAPY_TYPES:
+        errors.append("el tipo de terapia")
+    if not reason:
+        errors.append("qué te trae a terapia")
+    if not schedules and not schedule_other:
+        errors.append("qué horario te va mejor")
+    if errors:
+        return jsonify({"error": "Falta completar: " + ", ".join(errors) + "."}), 400
+    if not online_confirmed:
+        return jsonify({"error": "Confirma que las sesiones son online por Google Meet."}), 400
+    if not privacy_accepted:
+        return (
+            jsonify({"error": "Necesito tu consentimiento de protección de datos para poder atender tu solicitud."}),
+            400,
+        )
+    if language not in _THERAPY_LANGUAGES:
+        language = "Me da igual"
+    if source not in _THERAPY_SOURCES:
+        source = ""
+
+    schedule_txt = ", ".join(_THERAPY_SCHEDULES[s] for s in schedules)
+    if schedule_other:
+        schedule_txt = f"{schedule_txt} · Otro: {schedule_other}" if schedule_txt else f"Otro: {schedule_other}"
+
+    message_lines = [
+        "[Solicitud desde /terapia-online]",
+        f"Tipo de terapia: {_THERAPY_TYPES[therapy_type]}",
+        "Modalidad: Online (Google Meet)",
+        f"Horario preferido: {schedule_txt}",
+        f"Idioma: {language}",
+        f"Cómo me ha conocido: {source or 'No indicado'}",
+        f"Quiere novedades y recursos: {'Sí' if wants_news else 'No'}",
+        "",
+        "Qué le trae a terapia:",
+        reason,
+    ]
+    if questions:
+        message_lines += ["", "Preguntas:", questions]
+    message = "\n".join(message_lines)
+
+    contact_msg = ContactMessage(name=name, email=email, phone=phone, message=message)
+    db.session.add(contact_msg)
+
+    if wants_news:
+        # Consentimiento expreso de marketing (casilla opcional del formulario)
+        lead = MarketingLead.query.filter_by(email=email).first()
+        now_utc = datetime.now(timezone.utc)
+        if lead:
+            lead.consent_marketing = True
+            lead.last_seen_at = now_utc
+            if not lead.name:
+                lead.name = name
+        else:
+            db.session.add(
+                MarketingLead(
+                    email=email,
+                    name=name,
+                    consent_marketing=True,
+                    consent_text="Quiero recibir de vez en cuando novedades y recursos gratuitos. (Formulario de terapia)",
+                    source_resource_title="Formulario de terapia online",
+                    source_channel="formulario_terapia",
+                    accessed_resources_json="[]",
+                    unlock_count=0,
+                    created_at=now_utc,
+                    last_seen_at=now_utc,
+                )
+            )
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
+        db.session.add(ContactMessage(name=name, email=email, phone=phone, message=message))
+        db.session.commit()
+
+    sys_cfg = get_or_create_system_config()
+    admin_user = User.query.filter_by(role="admin").first()
+    target_email = sys_cfg.smtp_user or (admin_user.email if admin_user else "admin@vuelveati.com")
+    email_sent, email_log = send_system_email(
+        to_email=target_email,
+        subject=f"Nueva solicitud de terapia de {name}",
+        html_body=build_contact_notification_html(
+            name, email, phone, message, badge="Solicitud de terapia online"
+        ),
+    )
+    if not email_sent:
+        print(f"[TERAPIA] Fallo al notificar la solicitud #{contact_msg.id}: {email_log}")
+
+    return (
+        jsonify(
+            {
+                "message": "¡Gracias! He recibido tu solicitud y te responderé por email en menos de 24 horas.",
+                "email_dispatched": email_sent,
             }
         ),
         201,
@@ -226,14 +411,14 @@ def submit_contact():
 @admin_required
 def get_email_settings():
     config = get_or_create_system_config()
-    return jsonify({"settings": config.to_dict()}), 200
+    return jsonify({"settings": config.to_public_dict()}), 200
 
 
 @api_bp.route("/admin/email-settings", methods=["PUT"])
 @admin_required
 def update_email_settings():
     config = get_or_create_system_config()
-    data = request.get_json() or {}
+    data = restore_masked_secrets(request.get_json() or {}, config)
 
     config.smtp_host = (data.get("smtp_host") or "smtp.gmail.com").strip()
     config.smtp_port = int(data.get("smtp_port") or 587)
@@ -247,7 +432,7 @@ def update_email_settings():
         jsonify(
             {
                 "message": "Configuración de correo guardada correctamente en MySQL.",
-                "settings": config.to_dict(),
+                "settings": config.to_public_dict(),
             }
         ),
         200,
@@ -257,7 +442,9 @@ def update_email_settings():
 @api_bp.route("/admin/email-settings/test", methods=["POST"])
 @admin_required
 def test_email_connection():
-    data = request.get_json() or {}
+    data = restore_masked_secrets(
+        request.get_json() or {}, get_or_create_system_config()
+    )
     recipient = (data.get("test_recipient") or data.get("smtp_user") or "").strip()
 
     if not recipient:
@@ -310,7 +497,7 @@ def get_storage_settings_route():
     return (
         jsonify(
             {
-                "settings": config.to_dict(),
+                "settings": config.to_public_dict(),
                 "s3_ready": is_s3_ready(config.to_dict()),
             }
         ),
@@ -322,7 +509,7 @@ def get_storage_settings_route():
 @admin_required
 def update_storage_settings_route():
     config = get_or_create_system_config()
-    data = request.get_json() or {}
+    data = restore_masked_secrets(request.get_json() or {}, config)
 
     config.s3_enabled = bool(data.get("s3_enabled", False))
     config.s3_provider = (data.get("s3_provider") or "cloudflare_r2").strip()
@@ -340,7 +527,7 @@ def update_storage_settings_route():
         jsonify(
             {
                 "message": "Configuración de almacenamiento S3 / Cloudflare R2 guardada en MySQL.",
-                "settings": config.to_dict(),
+                "settings": config.to_public_dict(),
                 "s3_ready": is_s3_ready(config.to_dict()),
             }
         ),
@@ -351,7 +538,9 @@ def update_storage_settings_route():
 @api_bp.route("/admin/storage-settings/test", methods=["POST"])
 @admin_required
 def test_storage_settings_route():
-    data = request.get_json() or {}
+    data = restore_masked_secrets(
+        request.get_json() or {}, get_or_create_system_config()
+    )
     ok, msg, detailed_log = test_s3_connection(data)
     return (
         jsonify(
@@ -372,11 +561,11 @@ def test_storage_settings_route():
 @admin_required
 def get_calendar_settings():
     cfg = get_booking_config()
-    callback_url = f"{request.host_url.rstrip('/')}/api/admin/calendar/oauth-callback"
+    callback_url = _calendar_callback_url()
     return (
         jsonify(
             {
-                "settings": cfg,
+                "settings": mask_secret_fields(cfg),
                 "calendar_ready": is_calendar_ready(cfg),
                 "has_client_credentials": has_calendar_client_id(cfg),
                 "callback_url": callback_url,
@@ -386,41 +575,68 @@ def get_calendar_settings():
     )
 
 
+_OAUTH_STATE_SALT = "calendar-oauth-state"
+_OAUTH_STATE_MAX_AGE = 15 * 60  # segundos
+
+
+def _oauth_state_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(Config.JWT_SECRET_KEY, salt=_OAUTH_STATE_SALT)
+
+
+def _allowed_frontend_origins() -> list[str]:
+    origins = [
+        o.strip().rstrip("/")
+        for o in (Config.CORS_ORIGINS or "").split(",")
+        if o.strip() and o.strip() != "*"
+    ]
+    for d in (
+        "https://carlaviladotpsicologia.com",
+        "https://www.carlaviladotpsicologia.com",
+        "http://localhost:5173",
+    ):
+        if d not in origins:
+            origins.append(d)
+    return origins
+
+
+def _calendar_callback_url() -> str:
+    return f"{request.host_url.rstrip('/')}/api/admin/calendar/oauth-callback"
+
+
 @api_bp.route("/admin/calendar/oauth-url", methods=["GET"])
 @admin_required
 def get_calendar_oauth_url():
     """Devuelve la URL oficial de Google para iniciar el flujo OAuth2 con 1 clic."""
     cfg = get_booking_config()
+    redirect_uri = _calendar_callback_url()
 
-    # Si se pasa un token_json temporal en query params, usarlo
-    temp_json = request.args.get("calendar_token_json")
-    if temp_json:
-        cfg = dict(cfg)
-        cfg["calendar_use_gmail_token"] = False
-        cfg["calendar_token_json"] = temp_json
-
-    callback_url = f"{request.host_url.rstrip('/')}/api/admin/calendar/oauth-callback"
-    redirect_uri = request.args.get("redirect_uri") or callback_url
-
-    # Obtener el origen del frontend para redirigir tras la autorización
-    frontend_origin = request.headers.get("Origin") or request.referrer or ""
-    if frontend_origin:
+    # Origen del frontend al que volver tras la autorización (solo dominios permitidos)
+    allowed = _allowed_frontend_origins()
+    frontend_origin = ""
+    candidate = request.headers.get("Origin") or request.referrer or ""
+    if candidate:
         try:
-            parsed = urllib.parse.urlparse(frontend_origin)
-            frontend_origin = f"{parsed.scheme}://{parsed.netloc}"
+            parsed = urllib.parse.urlparse(candidate)
+            candidate = f"{parsed.scheme}://{parsed.netloc}"
         except Exception:
-            pass
+            candidate = ""
+    if candidate in allowed:
+        frontend_origin = candidate
     if not frontend_origin:
-        parsed_host = urllib.parse.urlparse(request.host_url)
-        frontend_origin = f"{parsed_host.scheme}://{parsed_host.hostname}:5173"
+        frontend_origin = allowed[0]
 
-    state_obj = {"frontend": frontend_origin, "redirect_uri": redirect_uri}
-    state_b64 = base64.urlsafe_b64encode(
-        json.dumps(state_obj).encode("utf-8")
-    ).decode("utf-8")
+    # State firmado (HMAC + caducidad): el callback solo acepta flujos iniciados
+    # por un administrador autenticado desde este endpoint.
+    state_token = _oauth_state_serializer().dumps(
+        {
+            "frontend": frontend_origin,
+            "admin_id": str(get_jwt_identity()),
+            "nonce": secrets.token_urlsafe(16),
+        }
+    )
 
     try:
-        auth_url = generate_google_oauth_url(cfg, redirect_uri, state=state_b64)
+        auth_url = generate_google_oauth_url(cfg, redirect_uri, state=state_token)
         return (
             jsonify(
                 {
@@ -437,34 +653,50 @@ def get_calendar_oauth_url():
 
 @api_bp.route("/admin/calendar/oauth-callback", methods=["GET"])
 def calendar_oauth_callback():
-    """Callback de Google OAuth2. Canjea el código por tokens y redirige al panel admin."""
+    """
+    Callback de Google OAuth2. Google redirige aquí sin JWT, así que la
+    autorización se comprueba con el `state` firmado que emitió oauth-url.
+    """
     code = request.args.get("code")
     error = request.args.get("error")
-    state_raw = request.args.get("state")
+    state_raw = request.args.get("state") or ""
 
-    frontend_base = "http://localhost:5173"
-    redirect_uri = f"{request.host_url.rstrip('/')}/api/admin/calendar/oauth-callback"
-    if state_raw:
-        try:
-            state_json = base64.urlsafe_b64decode(
-                state_raw.encode("utf-8")
-            ).decode("utf-8")
-            state_data = json.loads(state_json)
-            frontend_base = state_data.get("frontend") or frontend_base
-            redirect_uri = state_data.get("redirect_uri") or redirect_uri
-        except Exception:
-            pass
+    allowed = _allowed_frontend_origins()
+    redirect_uri = _calendar_callback_url()
 
-    frontend_target = f"{frontend_base.rstrip('/')}/admin/calendar-settings"
+    try:
+        state_data = _oauth_state_serializer().loads(
+            state_raw, max_age=_OAUTH_STATE_MAX_AGE
+        )
+    except (BadSignature, SignatureExpired):
+        state_data = None
+
+    frontend_base = allowed[0]
+    if state_data and state_data.get("frontend") in allowed:
+        frontend_base = state_data["frontend"]
+    # Vuelve directamente a la pestaña de calendario (sin pasar por redirecciones
+    # que podrían perder los parámetros google_connected / google_error)
+    frontend_target = f"{frontend_base.rstrip('/')}/admin/settings?tab=calendar"
+
+    if not state_data:
+        return redirect(
+            f"{frontend_target}&google_error={urllib.parse.quote('Solicitud de autorización no válida o caducada. Vuelve a pulsar Conectar con Google.')}"
+        )
+
+    admin_user = User.query.get(int(state_data.get("admin_id") or 0))
+    if not admin_user or admin_user.role != "admin" or not admin_user.is_active:
+        return redirect(
+            f"{frontend_target}&google_error={urllib.parse.quote('El administrador que inició la conexión ya no es válido.')}"
+        )
 
     if error:
         return redirect(
-            f"{frontend_target}?google_error={urllib.parse.quote(error)}"
+            f"{frontend_target}&google_error={urllib.parse.quote(error)}"
         )
 
     if not code:
         return redirect(
-            f"{frontend_target}?google_error={urllib.parse.quote('No se recibió código de autorización de Google.')}"
+            f"{frontend_target}&google_error={urllib.parse.quote('No se recibió código de autorización de Google.')}"
         )
 
     cfg = get_booking_config()
@@ -475,10 +707,10 @@ def calendar_oauth_callback():
         config.calendar_enabled = True
         config.calendar_use_gmail_token = False
         db.session.commit()
-        return redirect(f"{frontend_target}?google_connected=true")
+        return redirect(f"{frontend_target}&google_connected=true")
     except Exception as exc:
         return redirect(
-            f"{frontend_target}?google_error={urllib.parse.quote(str(exc))}"
+            f"{frontend_target}&google_error={urllib.parse.quote(str(exc))}"
         )
 
 
@@ -486,7 +718,7 @@ def calendar_oauth_callback():
 @admin_required
 def update_calendar_settings():
     config = get_or_create_system_config()
-    data = request.get_json() or {}
+    data = restore_masked_secrets(request.get_json() or {}, config)
 
     config.calendar_enabled = bool(data.get("calendar_enabled", False))
     config.calendar_use_gmail_token = bool(
@@ -520,7 +752,7 @@ def update_calendar_settings():
         jsonify(
             {
                 "message": "Configuración de Google Calendar y horario laboral guardada.",
-                "settings": cfg,
+                "settings": mask_secret_fields(cfg),
                 "calendar_ready": is_calendar_ready(cfg),
             }
         ),
@@ -531,7 +763,9 @@ def update_calendar_settings():
 @api_bp.route("/admin/calendar-settings/test", methods=["POST"])
 @admin_required
 def test_calendar_settings():
-    data = request.get_json() or {}
+    data = restore_masked_secrets(
+        request.get_json() or {}, get_or_create_system_config()
+    )
     ok, msg, detailed_log = test_calendar_connection(data)
     return (
         jsonify(
@@ -640,7 +874,7 @@ def presign_direct_upload():
     """
     data = request.get_json() or {}
     filename = sanitize_filename(data.get("filename") or "video.mp4")
-    folder = (data.get("folder") or "courses/videos").strip("/")
+    folder = sanitize_folder_prefix(data.get("folder") or "courses/videos")
     content_type = data.get("content_type") or "video/mp4"
 
     cfg = get_storage_config()
@@ -730,6 +964,7 @@ def upload_media_endpoint():
             {
                 "message": log_msg,
                 "media": meta,
+                "storage_warning": local_storage_warning(meta.get("storage_provider", "")),
             }
         ),
         201,
@@ -801,10 +1036,78 @@ def upload_media_chunk_endpoint():
                 "completed": True,
                 "message": log_msg,
                 "media": meta,
+                "storage_warning": local_storage_warning(meta.get("storage_provider", "")),
             }
         ),
         201,
     )
+
+
+def _lesson_files(lesson: Lesson) -> list[tuple[str, str]]:
+    files = []
+    if lesson.video_object_key:
+        files.append((lesson.video_storage_provider or "s3", lesson.video_object_key))
+    for res in lesson.resources:
+        if res.object_key:
+            files.append((res.storage_provider or "s3", res.object_key))
+    return files
+
+
+def _public_resource_files(res: PublicResource) -> list[tuple[str, str]]:
+    return [
+        (provider or "local", key)
+        for provider, key in (
+            (res.cover_storage_provider, res.cover_object_key),
+            (res.video_storage_provider, res.video_object_key),
+            (res.audio_storage_provider, res.audio_object_key),
+            (res.pdf_storage_provider, res.pdf_object_key),
+        )
+        if key
+    ]
+
+
+def _object_key_in_use(key: str) -> bool:
+    return bool(
+        Lesson.query.filter_by(video_object_key=key).first()
+        or LessonResource.query.filter_by(object_key=key).first()
+        or PublicResource.query.filter(
+            db.or_(
+                PublicResource.cover_object_key == key,
+                PublicResource.video_object_key == key,
+                PublicResource.audio_object_key == key,
+                PublicResource.pdf_object_key == key,
+            )
+        ).first()
+    )
+
+
+def _delete_orphan_files(files: list[tuple[str, str]]) -> None:
+    """
+    Tras borrar o sustituir contenido, elimina del bucket/disco los archivos que
+    ya no usa ninguna clase ni recurso. Se hace en segundo plano para no
+    retrasar la respuesta del panel.
+    """
+    files = [(p, k) for p, k in dict.fromkeys(files) if k]
+    if not files:
+        return
+    from flask import current_app
+    import threading as _threading
+
+    app_obj = current_app._get_current_object()
+
+    def _run():
+        with app_obj.app_context():
+            for provider, key in files:
+                try:
+                    if _object_key_in_use(key):
+                        continue
+                    ok, msg = delete_stored_object(provider, key)
+                    if not ok:
+                        print(f"[LIMPIEZA ARCHIVOS] {key}: {msg}")
+                except Exception as exc:
+                    print(f"[LIMPIEZA ARCHIVOS] {key}: {exc}")
+
+    _threading.Thread(target=_run, daemon=True).start()
 
 
 # ==========================================================
@@ -818,7 +1121,7 @@ def admin_list_courses():
     for c in courses:
         c_dict = c.to_dict(include_modules=True)
         c_dict["enrolled_students_count"] = Enrollment.query.filter_by(
-            course_id=c.id
+            course_id=c.id, status="active"
         ).count()
         result.append(c_dict)
     return (
@@ -954,8 +1257,10 @@ def admin_delete_course(course_id: int):
             ),
             400,
         )
+    old_files = [f for mod in course.modules for les in mod.lessons for f in _lesson_files(les)]
     db.session.delete(course)
     db.session.commit()
+    _delete_orphan_files(old_files)
     return jsonify({"message": "Curso eliminado correctamente."}), 200
 
 
@@ -1016,8 +1321,10 @@ def admin_update_module(module_id: int):
 @admin_required
 def admin_delete_module(module_id: int):
     mod = CourseModule.query.get_or_404(module_id)
+    old_files = [f for les in mod.lessons for f in _lesson_files(les)]
     db.session.delete(mod)
     db.session.commit()
+    _delete_orphan_files(old_files)
     return jsonify({"message": "Módulo eliminado correctamente."}), 200
 
 
@@ -1067,6 +1374,7 @@ def admin_create_lesson(module_id: int):
 def admin_update_lesson(lesson_id: int):
     lesson = Lesson.query.get_or_404(lesson_id)
     data = request.get_json() or {}
+    old_video = (lesson.video_storage_provider or "s3", lesson.video_object_key or "")
 
     if "title" in data and (data.get("title") or "").strip():
         lesson.title = data["title"].strip()
@@ -1102,6 +1410,8 @@ def admin_update_lesson(lesson_id: int):
         lesson.video_duration_seconds = int(data.get("video_duration_seconds") or 0)
 
     db.session.commit()
+    if old_video[1] and old_video[1] != (lesson.video_object_key or ""):
+        _delete_orphan_files([old_video])
     return (
         jsonify(
             {
@@ -1117,8 +1427,10 @@ def admin_update_lesson(lesson_id: int):
 @admin_required
 def admin_delete_lesson(lesson_id: int):
     lesson = Lesson.query.get_or_404(lesson_id)
+    old_files = _lesson_files(lesson)
     db.session.delete(lesson)
     db.session.commit()
+    _delete_orphan_files(old_files)
     return jsonify({"message": "Clase eliminada correctamente."}), 200
 
 
@@ -1169,8 +1481,10 @@ def admin_add_lesson_resource(lesson_id: int):
 @admin_required
 def admin_delete_lesson_resource(resource_id: int):
     res = LessonResource.query.get_or_404(resource_id)
+    old_files = [(res.storage_provider or "s3", res.object_key)]
     db.session.delete(res)
     db.session.commit()
+    _delete_orphan_files(old_files)
     return jsonify({"message": "Recurso eliminado de la clase."}), 200
 
 
@@ -1236,11 +1550,21 @@ def admin_update_student_enrollment(course_id: int, user_id: int):
     Permite al Admin:
     - Cambiar la fecha de inicio/pago (`enrolled_at`) de un alumno para recalcular su cronograma.
     - Activar o desactivar `unlock_all_override` (desbloquear todo el curso de golpe para ese alumno).
+    - Matricular (`status: "active"`) o dar de baja del curso (`status: "inactive"`).
     """
     course = Course.query.get_or_404(course_id)
     user = User.query.get_or_404(user_id)
-    enrollment = ensure_student_enrolled(user.id, course.id)
     data = request.get_json() or {}
+    enrollment = ensure_student_enrolled(user.id, course.id)
+
+    if "status" in data:
+        new_status = str(data.get("status") or "").strip().lower()
+        if new_status not in ("active", "inactive"):
+            return jsonify({"error": "Estado de matrícula no válido."}), 400
+        if new_status == "active" and enrollment.status != "active":
+            # Al (re)matricular, el cronograma empieza hoy salvo que se indique fecha
+            enrollment.enrolled_at = datetime.now(timezone.utc)
+        enrollment.status = new_status
 
     if "enrolled_at" in data and data["enrolled_at"]:
         try:
@@ -1501,12 +1825,14 @@ def campus_get_my_courses():
     user_id = int(get_jwt_identity())
     user = User.query.get_or_404(user_id)
 
-    # Asegurar inscripción en el primer curso activo
-    ensure_student_enrolled(user.id)
-
     active_courses = (
         Course.query.filter_by(is_active=True).order_by(Course.id.asc()).all()
     )
+    if user.role != "admin":
+        # El alumno solo ve los cursos en los que el admin le ha matriculado
+        active_courses = [
+            c for c in active_courses if get_active_enrollment(user.id, c.id)
+        ]
     roadmaps = [
         build_student_course_roadmap(user.id, course) for course in active_courses
     ]
@@ -1576,7 +1902,12 @@ def campus_get_lesson_video_stream(lesson_id: int):
         db.session.add(prog)
     else:
         prog.last_accessed_at = datetime.now(timezone.utc)
-    db.session.commit()
+    # Punto de partida para medir el tiempo real de reproducción
+    prog.progress_reported_at = datetime.now(timezone.utc)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        db.session.rollback()
 
     if not lesson.has_video or not lesson.video_object_key:
         return (
@@ -1665,24 +1996,48 @@ def campus_update_lesson_progress(lesson_id: int):
         )
         db.session.add(prog)
 
-    prog.last_accessed_at = datetime.now(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+    prog.last_accessed_at = now_utc
+    has_real_video = bool(lesson.has_video and lesson.video_object_key)
 
-    watched = float(data.get("watched_seconds", prog.watched_seconds or 0.0))
-    duration = float(
-        data.get("video_duration_seconds")
-        or prog.video_duration_seconds
-        or lesson.video_duration_seconds
-        or 0.0
-    )
+    try:
+        watched = max(0.0, float(data.get("watched_seconds", prog.watched_seconds or 0.0)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "Progreso no válido."}), 400
 
-    prog.watched_seconds = max(0.0, watched)
-    if watched > (prog.max_watched_seconds or 0.0):
-        prog.max_watched_seconds = watched
+    # La duración la fija la clase (detectada al subir el vídeo). El navegador
+    # solo puede aportarla si la clase aún no la tiene.
+    duration = float(lesson.video_duration_seconds or 0.0)
+    if duration <= 0:
+        try:
+            client_duration = float(data.get("video_duration_seconds") or 0.0)
+        except (TypeError, ValueError):
+            client_duration = 0.0
+        if 0 < client_duration <= 12 * 3600:
+            duration = client_duration
+            lesson.video_duration_seconds = int(round(client_duration))
+    if duration > 0:
+        watched = min(watched, duration)
+        prog.video_duration_seconds = duration
+
+    # Posición para reanudar: puede ser cualquiera (el alumno puede saltar).
+    prog.watched_seconds = watched
+
+    # Lo "visto" solo avanza al ritmo del tiempo real: como mucho 2x (velocidad
+    # de reproducción máxima) más un margen, desde el último informe aceptado.
+    # Saltar al final o enviar valores inventados no cuenta como visto.
+    last_report = prog.progress_reported_at
+    if last_report is not None and last_report.tzinfo is None:
+        last_report = last_report.replace(tzinfo=timezone.utc)
+    elapsed = (now_utc - last_report).total_seconds() if last_report else 0.0
+    elapsed = max(0.0, min(elapsed, 3600.0))
+    allowed_gain = elapsed * 2.0 + 10.0
+    prev_max = float(prog.max_watched_seconds or 0.0)
+    if watched > prev_max:
+        prog.max_watched_seconds = min(watched, prev_max + allowed_gain)
+    prog.progress_reported_at = now_utc
 
     if duration > 0:
-        prog.video_duration_seconds = duration
-        if not lesson.video_duration_seconds:
-            lesson.video_duration_seconds = int(round(duration))
         pct = min(100.0, round((prog.max_watched_seconds / duration) * 100.0, 1))
         prog.video_progress_percent = max(prog.video_progress_percent or 0.0, pct)
         prog.lesson_progress_percent = max(
@@ -1691,19 +2046,36 @@ def campus_update_lesson_progress(lesson_id: int):
         if prog.video_progress_percent >= 92.0 and not prog.is_completed:
             prog.is_completed = True
             prog.lesson_progress_percent = 100.0
-            prog.completed_at = datetime.now(timezone.utc)
+            prog.completed_at = now_utc
 
     if "is_completed" in data:
         if bool(data["is_completed"]):
+            # En clases con vídeo, solo se puede marcar como completada tras ver
+            # la mayor parte; en clases sin vídeo, cuando el alumno quiera.
+            if (
+                has_real_video
+                and not prog.is_completed
+                and float(prog.video_progress_percent or 0.0) < 80.0
+            ):
+                db.session.commit()
+                return (
+                    jsonify(
+                        {
+                            "error": "Termina de ver el vídeo de la clase para marcarla como completada.",
+                            "progress": prog.to_dict(),
+                        }
+                    ),
+                    400,
+                )
             prog.is_completed = True
             prog.lesson_progress_percent = 100.0
             if not prog.completed_at:
-                prog.completed_at = datetime.now(timezone.utc)
+                prog.completed_at = now_utc
         else:
             prog.is_completed = False
             prog.completed_at = None
             prog.lesson_progress_percent = (
-                prog.video_progress_percent if lesson.has_video else 0.0
+                prog.video_progress_percent if has_real_video else 0.0
             )
 
     db.session.commit()
@@ -2130,9 +2502,21 @@ def campus_book_session(lesson_id: int):
     except Exception:
         return jsonify({"error": "Formato de fecha u hora no válido."}), 400
 
+    if start_dt.tzinfo is None:
+        # Los huecos se ofrecen siempre en UTC con zona; sin zona se asume UTC.
+        start_dt = start_dt.replace(tzinfo=timezone.utc)
+
     cfg = get_booking_config()
     duration_min = max(15, int(cfg.get("session_duration_minutes") or 60))
     end_dt = start_dt + timedelta(minutes=duration_min)
+
+    # El alumno solo puede reservar huecos que la agenda ofrece como disponibles
+    # (horario laboral, antelación mínima, sin choques con Calendar ni con otras
+    # reservas). El admin puede saltarse esta comprobación.
+    if user.role != "admin":
+        slot_ok, slot_error = validate_requested_slot(cfg, start_dt)
+        if not slot_ok:
+            return jsonify({"error": slot_error}), 409
 
     # Convertir a naive UTC para MySQL
     start_naive = start_dt.astimezone(timezone.utc).replace(tzinfo=None)
@@ -2168,6 +2552,26 @@ def campus_book_session(lesson_id: int):
     )
     db.session.add(booking)
     db.session.commit()
+
+    # Si dos alumnos reservan el mismo hueco a la vez, ambos pasan la comprobación
+    # previa. Tras guardar, gana la reserva más antigua y la otra se retira.
+    earlier_overlap = SessionBooking.query.filter(
+        SessionBooking.id < booking.id,
+        SessionBooking.status == "confirmed",
+        SessionBooking.start_at < end_naive,
+        SessionBooking.end_at > start_naive,
+    ).first()
+    if earlier_overlap:
+        db.session.delete(booking)
+        db.session.commit()
+        return (
+            jsonify(
+                {
+                    "error": "Ese horario acaba de ser ocupado. Por favor, selecciona otro hueco.",
+                }
+            ),
+            409,
+        )
 
     # Sincronizar con Google Calendar si está configurado
     cal_log = ""
@@ -2478,22 +2882,45 @@ def _enrich_public_resource_dict(res: PublicResource, unlocked: bool = False) ->
     return data
 
 
-def _extract_visitor_lead_email() -> str:
-    email_raw = (
-        request.args.get("lead_email")
-        or request.headers.get("X-Lead-Email")
-        or ""
-    ).strip().lower()
-    return email_raw
+_LEAD_TOKEN_SALT = "public-resources-lead"
+_LEAD_TOKEN_MAX_AGE = 365 * 24 * 3600  # 1 año
 
 
-def _check_lead_unlocked(email_clean: str) -> MarketingLead | None:
-    if not email_clean or "@" not in email_clean:
+def _lead_token_serializer() -> URLSafeTimedSerializer:
+    return URLSafeTimedSerializer(Config.JWT_SECRET_KEY, salt=_LEAD_TOKEN_SALT)
+
+
+def _issue_lead_token(lead: MarketingLead) -> str:
+    return _lead_token_serializer().dumps({"lead_id": lead.id, "email": lead.email})
+
+
+def _lead_from_request() -> MarketingLead | None:
+    """
+    Reconoce al visitante por el token firmado que recibió al desbloquear un
+    recurso (cabecera X-Lead-Token). Ya no se acepta el email en claro: con él,
+    cualquiera podía consultar los datos de un lead conociendo su correo.
+    """
+    token = (request.headers.get("X-Lead-Token") or "").strip()
+    if not token:
         return None
-    lead = MarketingLead.query.filter_by(email=email_clean).first()
-    if lead and lead.consent_marketing:
-        return lead
-    return None
+    try:
+        payload = _lead_token_serializer().loads(token, max_age=_LEAD_TOKEN_MAX_AGE)
+    except (BadSignature, SignatureExpired):
+        return None
+    lead = MarketingLead.query.get(int(payload.get("lead_id") or 0))
+    if not lead or lead.email != payload.get("email") or not lead.consent_marketing:
+        return None
+    return lead
+
+
+def _public_lead_dict(lead: MarketingLead | None, token: str | None = None) -> dict | None:
+    """Solo lo que el propio visitante necesita ver; nunca su historial."""
+    if not lead:
+        return None
+    data = {"email": lead.email, "name": lead.name or ""}
+    if token:
+        data["token"] = token
+    return data
 
 
 def _record_lead_resource_access(lead: MarketingLead, res: PublicResource) -> None:
@@ -2534,8 +2961,7 @@ def public_list_resources():
     Si el visitante ya tiene su email guardado en caché (localStorage) y figura
     en `marketing_leads`, indica `is_lead_recognized: True`.
     """
-    visitor_email = _extract_visitor_lead_email()
-    lead = _check_lead_unlocked(visitor_email)
+    lead = _lead_from_request()
     is_unlocked = lead is not None
 
     resources = (
@@ -2551,7 +2977,7 @@ def public_list_resources():
                     for r in resources
                 ],
                 "is_lead_recognized": is_unlocked,
-                "lead": lead.to_dict() if lead else None,
+                "lead": _public_lead_dict(lead),
             }
         ),
         200,
@@ -2562,7 +2988,7 @@ def public_list_resources():
 def public_get_resource_detail(slug_or_id: str):
     """
     Devuelve el detalle de un recurso por su slug o ID.
-    - Si el visitante aporta un `lead_email` ya registrado con consentimiento de marketing,
+    - Si el visitante aporta un token de lead válido (cabecera X-Lead-Token),
       desbloquea automáticamente todo el recurso sin volver a pedir el correo.
     - Si no, devuelve solo el Teaser Editorial para mostrar la tarjeta de captura de email.
     """
@@ -2574,8 +3000,7 @@ def public_get_resource_detail(slug_or_id: str):
 
     res.views_count = int(res.views_count or 0) + 1
 
-    visitor_email = _extract_visitor_lead_email()
-    lead = _check_lead_unlocked(visitor_email)
+    lead = _lead_from_request()
     is_unlocked = lead is not None
 
     if is_unlocked and lead:
@@ -2599,7 +3024,7 @@ def public_get_resource_detail(slug_or_id: str):
             {
                 "resource": _enrich_public_resource_dict(res, unlocked=is_unlocked),
                 "is_unlocked": is_unlocked,
-                "lead": lead.to_dict() if lead else None,
+                "lead": _public_lead_dict(lead),
                 "related_resources": [
                     _enrich_public_resource_dict(r, unlocked=False) for r in related
                 ],
@@ -2610,6 +3035,7 @@ def public_get_resource_detail(slug_or_id: str):
 
 
 @api_bp.route("/resources/<string:slug_or_id>/unlock", methods=["POST"])
+@rate_limit("resource-unlock", limit=10, window_seconds=3600)
 def public_unlock_resource(slug_or_id: str):
     """
     Registra o actualiza el correo electrónico del visitante para Email Marketing
@@ -2710,7 +3136,13 @@ def public_unlock_resource(slug_or_id: str):
             {
                 "message": "¡Recurso desbloqueado! Hemos guardado tu acceso en este navegador para que no tengas que volver a introducir tu correo.",
                 "unlocked": True,
-                "lead": lead.to_dict(),
+                "lead": {
+                    # Solo se devuelve lo que el visitante acaba de escribir: el email
+                    # podría ser de otra persona y no debe revelar sus datos guardados.
+                    "email": email_clean,
+                    "name": name_clean,
+                    "token": _issue_lead_token(lead),
+                },
                 "resource": _enrich_public_resource_dict(res, unlocked=True),
             }
         ),
@@ -3125,6 +3557,16 @@ def public_seo_sitemap():
     </image:image>
   </url>""",
         f"""  <url>
+    <loc>{base_url}/terapia-online</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.9</priority>
+    <image:image>
+      <image:loc>{base_url}/images/terapia/carla-viladot-psicologa-terapia-online.webp</image:loc>
+      <image:title>Carla Viladot · Psicóloga online · Terapia individual y de pareja</image:title>
+    </image:image>
+  </url>""",
+        f"""  <url>
     <loc>{base_url}/recursos</loc>
     <lastmod>{latest_res_date}</lastmod>
     <changefreq>daily</changefreq>
@@ -3369,9 +3811,12 @@ def admin_create_public_resource():
 def admin_update_public_resource(res_id: int):
     res = PublicResource.query.get_or_404(res_id)
     data = request.get_json() or {}
+    old_files = _public_resource_files(res)
     _apply_resource_payload(res, data)
     res.updated_at = datetime.now(timezone.utc)
     db.session.commit()
+    # Archivos sustituidos o quitados en esta edición
+    _delete_orphan_files(old_files)
 
     return (
         jsonify(
@@ -3388,8 +3833,10 @@ def admin_update_public_resource(res_id: int):
 @admin_required
 def admin_delete_public_resource(res_id: int):
     res = PublicResource.query.get_or_404(res_id)
+    old_files = _public_resource_files(res)
     db.session.delete(res)
     db.session.commit()
+    _delete_orphan_files(old_files)
     return jsonify({"message": "Recurso eliminado correctamente."}), 200
 
 

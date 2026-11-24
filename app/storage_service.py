@@ -33,14 +33,73 @@ def _get_ssl_context() -> ssl.SSLContext:
 
 from app.models import SystemConfig, db
 
+# Carpeta del almacenamiento local. En producción conviene apuntarla a un
+# volumen persistente (MEDIA_STORAGE_DIR=/data/protected_media en Coolify o
+# Railway): el disco del contenedor se borra en cada redespliegue.
 PROTECTED_STORAGE_DIR = os.path.abspath(
-    os.path.join(os.path.dirname(__file__), "..", "protected_media")
+    (os.getenv("MEDIA_STORAGE_DIR") or "").strip()
+    or os.path.join(os.path.dirname(__file__), "..", "protected_media")
+)
+LOCAL_STORAGE_IS_PERSISTENT = bool((os.getenv("MEDIA_STORAGE_DIR") or "").strip())
+
+LOCAL_STORAGE_WARNING = (
+    "Archivo guardado en el disco del servidor, no en Cloudflare R2. Si el "
+    "servidor se redespliega sin un volumen persistente, este archivo se perderá. "
+    "Activa R2 en Configuración → Almacenamiento o define MEDIA_STORAGE_DIR."
 )
 
 
 def ensure_protected_storage_dir() -> str:
     os.makedirs(PROTECTED_STORAGE_DIR, exist_ok=True)
     return PROTECTED_STORAGE_DIR
+
+
+def local_storage_warning(storage_provider: str) -> str:
+    """Aviso para el panel cuando un archivo se queda en un disco que no persiste."""
+    if storage_provider == "local" and not LOCAL_STORAGE_IS_PERSISTENT:
+        return LOCAL_STORAGE_WARNING
+    return ""
+
+
+def sanitize_folder_prefix(folder: str, default: str = "courses") -> str:
+    """Evita rutas como '../../' en la carpeta de destino de una subida."""
+    parts = [
+        re.sub(r"[^a-zA-Z0-9_-]", "", p)
+        for p in str(folder or "").replace("\\", "/").split("/")
+    ]
+    parts = [p for p in parts if p and p not in (".", "..")]
+    return "/".join(parts) or default
+
+
+def resolve_local_path(object_key: str) -> str | None:
+    """Ruta absoluta de un objeto local, o None si se sale de la carpeta protegida."""
+    base_dir = ensure_protected_storage_dir()
+    full_path = os.path.abspath(os.path.join(base_dir, object_key.replace("/", os.sep)))
+    if os.path.commonpath([base_dir, full_path]) != base_dir or full_path == base_dir:
+        return None
+    return full_path
+
+
+def delete_stored_object(storage_provider: str, object_key: str) -> tuple[bool, str]:
+    """Borra un archivo del bucket o del disco local. Nunca toca los PDFs semilla."""
+    key = (object_key or "").strip()
+    if not key or key.startswith(("http://", "https://", "seed_resources/")):
+        return False, "Nada que borrar."
+    if (storage_provider or "").strip() == "s3":
+        cfg = get_storage_config()
+        if not is_s3_ready(cfg):
+            return False, "R2/S3 no está configurado; el objeto no se ha borrado."
+        return delete_file_from_s3(key, cfg=cfg)
+    full_path = resolve_local_path(key)
+    if not full_path:
+        return False, "Ruta local no válida."
+    try:
+        if os.path.isfile(full_path):
+            os.remove(full_path)
+            return True, "Archivo local eliminado."
+        return False, "El archivo local ya no existía."
+    except Exception as exc:
+        return False, f"No se pudo borrar el archivo local: {exc}"
 
 
 def sanitize_filename(filename: str) -> str:
@@ -539,7 +598,7 @@ def store_uploaded_filepath(
     orig_name = sanitize_filename(original_filename or "archivo")
     effective_mime = mime_type or "application/octet-stream"
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
-    object_key = f"{folder_prefix.strip('/')}/{timestamp}_{orig_name}"
+    object_key = f"{sanitize_folder_prefix(folder_prefix)}/{timestamp}_{orig_name}"
     size_bytes = os.path.getsize(file_path)
 
     cfg = get_storage_config()
@@ -571,8 +630,9 @@ def store_uploaded_filepath(
         s3_error_note = f" (Aviso S3: {log_msg})"
 
     # Almacenamiento local protegido (o fallback automático si S3 falló temporalmente)
-    base_dir = ensure_protected_storage_dir()
-    full_path = os.path.join(base_dir, object_key.replace("/", os.sep))
+    full_path = resolve_local_path(object_key)
+    if not full_path:
+        return False, {}, "Ruta de destino no válida."
     os.makedirs(os.path.dirname(full_path), exist_ok=True)
     shutil.move(file_path, full_path)
 

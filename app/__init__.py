@@ -138,6 +138,15 @@ def ensure_schema_columns_via_sqlalchemy() -> bool:
             "lessons": [
                 ("booking_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
             ],
+            "student_lesson_progress": [
+                ("progress_reported_at", "DATETIME NULL"),
+            ],
+            "marketing_campaign_recipients": [
+                ("processing_started_at", "DATETIME NULL"),
+            ],
+            "marketing_automation_queue": [
+                ("processing_started_at", "DATETIME NULL"),
+            ],
             "system_config": [
                 ("s3_enabled", "TINYINT(1) NOT NULL DEFAULT 0"),
                 ("s3_provider", "VARCHAR(50) DEFAULT 'cloudflare_r2'"),
@@ -228,9 +237,17 @@ def seed_initial_data() -> None:
         admin.set_password(Config.ADMIN_DEFAULT_PASSWORD)
         db.session.add(admin)
 
+    # El alumno de demostración solo se crea si se pide expresamente
+    # (SEED_DEMO_STUDENT=true), para no dejar una cuenta con contraseña pública
+    # en producción.
+    seed_demo_student = os.getenv("SEED_DEMO_STUDENT", "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
     demo_student_email = "alumno@vuelveati.com"
     student = User.query.filter_by(email=demo_student_email).first()
-    if not student:
+    if not student and seed_demo_student:
         student = User(
             name="Lucía Mendoza",
             email=demo_student_email,
@@ -643,13 +660,28 @@ def create_app() -> Flask:
     CORS(
         app,
         resources={r"/api/*": {"origins": cors_origins}},
-        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Lead-Email", "Range"],
+        allow_headers=["Content-Type", "Authorization", "X-Requested-With", "X-Lead-Token", "Range"],
         expose_headers=["Content-Range", "Accept-Ranges", "Content-Length"],
         methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
     )
 
     db.init_app(app)
     jwt.init_app(app)
+
+    @jwt.token_in_blocklist_loader
+    def _token_revoked(_jwt_header, jwt_payload) -> bool:
+        """
+        Un token deja de valer en cuanto el usuario se desactiva, se borra o cambia
+        de rol, sin esperar a que caduquen las 12 h del JWT.
+        """
+        try:
+            user = db.session.get(User, int(jwt_payload.get("sub")))
+        except Exception:
+            return True
+        if not user or not user.is_active:
+            return True
+        token_role = jwt_payload.get("role")
+        return bool(token_role and token_role != user.role)
 
     app.register_blueprint(api_bp, url_prefix="/api")
     app.register_blueprint(marketing_bp, url_prefix="/api")
