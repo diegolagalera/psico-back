@@ -280,7 +280,7 @@ def submit_contact():
 
 _THERAPY_TYPES = {"individual": "Terapia individual (60 €)", "pareja": "Terapia de pareja (70 €)"}
 _THERAPY_SCHEDULES = {"9-13": "9 a 13 h", "13-15": "13 a 15 h", "15-20": "15 a 20 h"}
-_THERAPY_LANGUAGES = ("Castellano", "Català", "Me da igual")
+_THERAPY_LANGUAGES = ("Castellano", "Catalán")
 _THERAPY_SOURCES = (
     "Instagram",
     "Google",
@@ -344,7 +344,7 @@ def submit_therapy_request():
             400,
         )
     if language not in _THERAPY_LANGUAGES:
-        language = "Me da igual"
+        language = "Castellano"
     if source not in _THERAPY_SOURCES:
         source = ""
 
@@ -3582,6 +3582,24 @@ def public_seo_sitemap():
       <image:loc>{base_url}/images/carla-viladot.jpg</image:loc>
       <image:title>Carla Viladot · Psicóloga especialista en ruptura de pareja y duelo afectivo</image:title>
     </image:image>
+  </url>""",
+        f"""  <url>
+    <loc>{base_url}/programa-vuelve-a-ti</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.9</priority>
+  </url>""",
+        f"""  <url>
+    <loc>{base_url}/sobre-mi</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>monthly</changefreq>
+    <priority>0.7</priority>
+  </url>""",
+        f"""  <url>
+    <loc>{base_url}/contacto</loc>
+    <lastmod>{latest_res_date}</lastmod>
+    <changefreq>yearly</changefreq>
+    <priority>0.6</priority>
   </url>""",
         f"""  <url>
     <loc>{base_url}/terapia-online</loc>
